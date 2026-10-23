@@ -2,14 +2,17 @@
 
 Plan v1. 2026-10-23.
 
-Edgent is an open-source desktop agent for studying and teaching, in the
-shape of Claude Code and the Antigravity CLI: a thin agent loop, a small set
-of powerful general tools, state kept in files, verification by actually
+Edgent is an open-source desktop agent in the class of Claude Code, the
+Antigravity CLI, OpenCode and OpenClaw: a thin agent loop, a small set of
+powerful general tools, state kept in files, verification by actually
 running things, and extensibility through skills, subagents, hooks and MCP.
-Where those harnesses point at a codebase, Edgent points at a **study
-workspace**: sources, a book being written, media, assessments, sessions,
-and a learner model. No SaaS, no embeddings, no load balancing. One person,
-one machine, one subscription or one API key.
+It is **general purpose first**: given a capable model it does whatever it is
+asked, coding included, because the core tools are the coding tools. On top
+of that it carries a deep **education layer**: a study workspace (sources, a
+book being written, media, assessments, sessions, a learner model), the
+skills that hold the pedagogy, and the verification tools that make a
+chapter, a film or an assignment checkable. No SaaS, no embeddings, no load
+balancing. One person, one machine, one subscription or one API key.
 
 This document is the plan. Section 1 is what we took from reverse-engineering
 the good harnesses. Section 2 is a critical look at the current repository.
@@ -32,6 +35,8 @@ engineering conventions. The pattern is the same everywhere.
 | **Anthropic, long-running agents** | Two prompts over one harness: an initializer session writes a feature list (JSON, hundreds of entries, all failing), a progress log and an `init.sh`; worker sessions each take **one** feature, orient from the progress file and git log, build, verify as a user would, commit, update progress. Failure modes found: premature "done", context loss between sessions, untested success. | This is exactly how a 300-page book gets written by a model with a 200k window: outline as the feature list, one chapter per session, git as state. |
 | **Anthropic, context engineering** | Context is a finite resource with diminishing returns. Keep lightweight identifiers and load just in time. Compaction: maximise recall, then precision. Structured note-taking outside the window. Subagents return condensed summaries. Tools must be self-contained, distinct, and clear. | The context assembly order, compaction policy, and tool design rules in sections 6 and 7. |
 | **Gemini CLI / Codex / OpenCode** (open source) | Core package vs UI package. Tool registry with schemas and confirmation. Context files (`GEMINI.md`, `AGENTS.md`). Checkpointing. History compression. MCP client. Hooks and extensions. | Core/UI split so the same engine serves a CLI, a local web UI and a desktop shell. Settings and context-file precedence. |
+| **OpenCode** (open source) | Client/server: one local server with an OpenAPI spec; the TUI, desktop app, IDE extension and web UI are interchangeable clients. Twenty-plus providers behind one model layer, including local models. Two built-in agents, `build` (full access) and `plan` (read-only). LSP, MCP, SQLite storage, PTY for shells. | The local-server-plus-clients split: `edgent serve` is the engine; CLI, web reader and a future desktop shell are clients of it. Provider breadth as a first-class goal. |
+| **OpenClaw** (open source) | A local gateway process at the centre, bound to localhost; channel adapters (WhatsApp, Telegram, Slack and others) route messages into agent sessions; skills as Markdown plus scripts installed from a registry; layered memory (JSONL transcripts, `MEMORY.md`, daily notes); a **heartbeat** that wakes the agent on a schedule so it can act without being asked. | The heartbeat: due reviews, streak and reminder nudges, background builds continuing. Skills as a shareable registry format. (Its vector memory is not taken.) |
 | **REA** (`morluto/rea`) | An MCP server plus CLI that *any* agent (Claude Code, Codex, Cursor, Gemini CLI) drives. Dependencies point inward (domain ← application ← adapters). Evidence, derivations, inferences and unknowns kept distinct. Typed error algebra with `Result`, partial facts preserved. Compact tool schemas by default. Tests prefer real public workflows over module tests. Performance priority one is agent tokens. | The architecture discipline, and the insight that **the tool-and-skill layer is the durable asset; the loop is a commodity**. Edgent therefore ships as an MCP server and skill set that `agy` and Claude Code can host, *and* as its own loop for API-key mode. |
 
 The twelve principles that fall out:
@@ -86,6 +91,8 @@ Dropped from the spine: `orchestration/dag.py`, `planner.py`, `classifier.py`, `
 
 **A desktop tool, installed, not hosted.** `pipx install edgent` or a single installer. Later a Tauri or Electron shell around the same local server. No accounts, no server of ours.
 
+**General purpose first.** The core tool set (read, write, edit, bash, glob, grep, web, agent, skill, todo) is the one a coding agent needs, so coding, data work, writing, research and automation work out of the box with no education layer involved. "Refactor this module and run the tests", "scrape these pages into a CSV", "write a Manim scene for this proof" are all the same loop. The education layer adds a workspace convention, skills, subagents and checks; it never narrows what the agent may be asked.
+
 **Two modes, one engine.**
 
 | Mode | What it is | Harness analogue |
@@ -108,10 +115,11 @@ Host mode is the REA pattern and is the right first deliverable: it works today 
 
 ```mermaid
 flowchart TD
-    subgraph UI["Surfaces"]
+    subgraph UI["Clients of the local server (edgent serve)"]
       CLI[edgent CLI / TUI]
-      WEB[Local web UI: reader, player, reviewer]
+      WEB[Local web UI: reader, player, reviewer, dashboard]
       HOST[External host: agy / claude / codex via MCP]
+      HB[Heartbeat scheduler]
     end
     subgraph APP["Application"]
       LOOP[Agent loop]
@@ -136,6 +144,7 @@ flowchart TD
     WS[(Study workspace: files + git)]
     CLI --> LOOP
     WEB --> LOOP
+    HB --> LOOP
     HOST --> TOOLS
     LOOP --> CTX --> WS
     LOOP --> TOOLS
@@ -353,6 +362,10 @@ Where grep is weaker than vectors (paraphrase, cross-lingual questions), a cheap
 
 **Learner.** `learner/mastery.json` is written only by the `observer` subagent and the `learner_update` tool, from evidence (a correct answer, a corrected misconception, a request for a re-explanation). It feeds the tutor's system context as a short rendered block, and the `examiner` for personalisation.
 
+**Motivation (gamification).** `learner/progress.json` holds streaks, points and badges, all derived from evidence the harness already records: a verified unit built, a learning session completed, an item answered correctly after a lapse, a mastery level reached. Nothing is awarded by the model's say-so; the `learner_update` path computes it from the ledger. The web dashboard shows it; `STUDY.md` can switch it off or tune it ("no streaks, badges only"). The heartbeat (below) is what makes streaks meaningful: a due-review nudge at the time the user chose.
+
+**Heartbeat.** A scheduler inside `edgent serve`, after OpenClaw: at configured times it wakes the agent with a fixed prompt ("reviews due, build units pending, anything to report") and the agent acts under the same permissions as an interactive session. This is how spaced repetition reminders, background builds resuming, and daily study briefs happen without a cloud.
+
 **Preferences.** `knowledge/house.md`: how this user likes things explained; rewritten whole by a distiller, never appended, capped in size, with a pinned section the model may not edit. Antigravity's knowledge base and ai-tutor's house memory are the same idea.
 
 **Procedural.** Skills and subagent definitions. When the user corrects the same thing twice, the agent proposes a one-line addition to the relevant skill, as an artifact for approval.
@@ -388,11 +401,11 @@ All of it is the same loop with the same tools; only the skill invoked and the s
 
 ### 11.1 Feature cut
 
-In for v1: workspace and ingestion with locators; tutor chat with clickable citations; book and course builds with the done-gate; assessments with verified keys, personalised from the learner model; learning sessions with spaced repetition; typed mock interviews; diagrams and widgets verified in Chromium; Manim films gated behind `edgent doctor`.
+In for v1: the general-purpose agent (coding, research, writing, automation, with the full core tool set and MCP); workspace and ingestion with locators; tutor chat with clickable citations; book and course builds with the done-gate; assessments with verified keys, personalised from the learner model; learning sessions with spaced repetition; typed mock interviews; streaks, points and badges computed from the progress ledger, with the heartbeat for reminders; diagrams and widgets verified in Chromium; Manim films gated behind `edgent doctor`.
 
 Deferred to v2: voice in and out (worth it for interviews and read-aloud, but heavy); narrated video assembly with TTS; a desktop shell (the local web UI covers it until the core is stable).
 
-Out permanently: anything multi-user (cohorts, sharing, accounts, gateways, tunnels); embeddings and vector indexes; gamification; LMS and classroom integrations; real-time collaboration.
+Out: anything multi-user (cohorts, sharing, accounts, public gateways, tunnels); embeddings and vector indexes; LMS and classroom integrations; real-time collaboration. A built book or course exports as HTML, PDF or EPUB, which is how it reaches other people.
 
 ---
 
@@ -499,4 +512,6 @@ Order matters: M3 before M5 means the tool and skill layer is proven under a bat
 - Antigravity CLI (`agy`): https://codelabs.developers.google.com/antigravity-cli-hands-on , https://computingforgeeks.com/install-antigravity-cli-linux-macos-windows/
 - REA, Reverse Engineer Anything: https://github.com/morluto/rea (AGENTS.md and docs/architecture.mermaid)
 - Gemini CLI (open source sibling of `agy`): https://github.com/google-gemini/gemini-cli
+- OpenCode: https://github.com/anomalyco/opencode and https://www.analyticsvidhya.com/blog/2026/09/opencode-ai-explained/
+- OpenClaw architecture: https://clawdocs.org/architecture/overview and https://bibek-poudel.medium.com/how-openclaw-works-understanding-ai-agents-through-a-real-architecture-5d59cc7a4764
 - Measured `agy` and `claude` print-mode behaviour: `edgentai/ai-tutor`, `mentor_view/tools/gemini_bridge.py` and `claude_bridge.py`
