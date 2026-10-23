@@ -1,0 +1,8 @@
+{
+  "name": "golden_text_v1",
+  "cases": [
+    {"id": "text_revenue", "task": "What was the revenue in Q3?", "inline_texts": ["Quarterly report. Revenue was 1,250,000 dollars in Q3. Headcount grew to 48 people."], "expected_regex": "1,?250,?000", "modality": "text", "task_type": "convergent"},
+    {"id": "text_decision", "task": "What did the team decide about the launch date?", "inline_texts": ["Meeting notes 12 May. The team decided to move the launch to 3 June. Action: Priya updates the roadmap."], "expected_regex": "3 June", "modality": "text", "task_type": "convergent"},
+    {"id": "text_no_inputs", "task": "Explain what a content-addressed artifact store is.", "must_cite": false, "modality": "text", "task_type": "convergent", "effort": "minimal"}
+  ]
+}
