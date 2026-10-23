@@ -39,6 +39,38 @@ engineering conventions. The pattern is the same everywhere.
 | **OpenClaw** (open source) | A local gateway process at the centre, bound to localhost; channel adapters (WhatsApp, Telegram, Slack and others) route messages into agent sessions; skills as Markdown plus scripts installed from a registry; layered memory (JSONL transcripts, `MEMORY.md`, daily notes); a **heartbeat** that wakes the agent on a schedule so it can act without being asked. | The heartbeat: due reviews, streak and reminder nudges, background builds continuing. Skills as a shareable registry format. (Its vector memory is not taken.) |
 | **REA** (`morluto/rea`) | An MCP server plus CLI that *any* agent (Claude Code, Codex, Cursor, Gemini CLI) drives. Dependencies point inward (domain ← application ← adapters). Evidence, derivations, inferences and unknowns kept distinct. Typed error algebra with `Result`, partial facts preserved. Compact tool schemas by default. Tests prefer real public workflows over module tests. Performance priority one is agent tokens. | The architecture discipline, and the insight that **the tool-and-skill layer is the durable asset; the loop is a commodity**. Edgent therefore ships as an MCP server and skill set that `agy` and Claude Code can host, *and* as its own loop for API-key mode. |
 
+### 1.1 REA, read closely: what transfers
+
+REA is not a harness. It has no loop, no memory and no compaction; it leaves
+those to the host and ships a tool server, a skill and an evaluation gate. That
+is the point of reading it: it is the best public example of **the layer under
+the loop** done with discipline, and that layer is where Edgent's value lives.
+Taken from its source (`src/domain/evidence.ts`, `residualUnknown.ts`,
+`application/investigation/EvidenceLedger.ts`, `evaluation/`,
+`contracts/compactInputSchema.ts`, `docs/error-contract.schema.json`,
+`docs/design/limits-and-recovery.md`, `docs/tool-design.md`,
+`.agents/skills/reverse-engineer-anything/SKILL.md`):
+
+| REA mechanism | What it is | Edgent use |
+|---|---|---|
+| **Evidence record** | One immutable, content-addressed record per observation: `operation`, `parameters`, `normalized_result`, `confidence` (`observed`, `derived`, `inferred`), `authority` (shipped artifact, controlled replay, historical reference, external service, analyst inference), `limitations[]`, `locations[]`, `evidence_links[]`. The id is a digest of the semantic projection, so the same fact from two runs has one id and a conflicting record is rejected. | Every fact a chapter, answer or assessment rests on becomes an Evidence record in `evidence/`: a passage from `sources/text/` is *observed* with authority *source*; an answer key computed in the sandbox is *derived* with authority *controlled replay*; a web claim is *external service*; a model judgement is *inferred* with authority *model*. Citations are evidence ids. `check_cite` resolves them, and the tutor's "this goes beyond the sources" is the authority ladder speaking. |
+| **Residual unknowns ledger** | A durable record per open question: `status` (open, investigating, blocked, contradicted, resolved), `severity`, `domain`, supporting and contradicting evidence ids, `required_confidence`, `required_authority`, `recommended_probes`, relationships (`depends-on`, `contradicts`), a resolution with disposition and evidence. Revisions are chained by digest. | `unknowns.json` in the workspace. A build records gaps in the sources, contradictions between sources, a concept used before the outline introduces it, a film brief that cannot be verified. A tutor records a question the sources could not answer, with the probe that would (deep research). The walkthrough artifact is the unknowns ledger rendered. Unknowns are never deleted, only resolved with evidence, withdrawn or marked out of scope, with a rationale. |
+| **Obligation ledger** | From the evidence, derive a deterministic list of claims that must be closed; each names the required case kinds and the **authority a verifier must have**; a claim closes only when a verifier of comparable authority passes and its result is in the bundle. Contradictions and residual unknowns keep it open. | The done-gate becomes an obligation ledger per unit instead of a checklist: every formula owes a derivation or an intuition, every code block owes an execution, every exercise owes a key verified by computation, every claim owes evidence of the required authority, every film owes a render, measurements and a look. `book_mark_done` closes obligations; it cannot close one with a weaker verifier (a model's opinion does not close "the code runs"). |
+| **Canonical error contract** | Every failure is `{code, category, message, retryable, remediation.action, recovery?, details}` with categories such as `invalid_input`, `truncated`, `timeout`, `resource_constraint`, `unavailable`, `execution_failure`. `recovery.kind` is a bounded next step ("re-read this operation's input schema", "inspect timeout state"). Partial observations are preserved. The rule to agents: do not repeat the unchanged call. | The tool registry's `ToolError` grows `category`, `remediation` and `recovery`. A renderer that produced 18 of 20 beats returns 18 beats and one error. The `agy` prompt ceiling is category `truncated` with remediation "send less"; a missing TeX is `unavailable` with the install command. |
+| **Limits-and-recovery rule** | Every ceiling is a named constant with a unit; a setting when operators need headroom, with floor and maximum and no silent fallback; the failure text names the limit, its effective value and source, the next action, whether a restart is needed, and **what does not raise it**. | Applied to every budget: provider prompt bytes, context tokens, render timeouts, subagent count, build wall clock. This is the discipline that prevents the silent-truncation class of bug. |
+| **Compact schema presentation** | Tool input schemas are advertised in a compact profile under a byte budget: annotations stripped from subschemas, root description kept, depth capped, validation keywords preserved; the full profile on request. | Same, with a measured budget per provider. Under `agy`'s ceiling the schema budget is real money. |
+| **Coverage is a producer fact** | An inventory declares `coverage.status` as `complete` or `unknown`; consumers may not infer coverage from prose, and missing coverage is *unknown*, not *absence*. | A source text view declares coverage (pages extracted, pages failed OCR, minutes transcribed). A grep miss on a source with unknown coverage is not "the source does not say it", and the tutor must say so. |
+| **Agent evaluation gate** | A scenario passes only if: exit 0, the tool was used naturally, the correct first tool was chosen, zero repeated identical calls, zero input validation failures, the required tool subsequence was met, and fixture claims are supported by evidence of the right confidence and authority; where no truth oracle exists, answer heuristics plus an **epistemic cue** ("unverified") must be present. | Edgent's eval gate, verbatim in spirit: a chapter eval requires the subsequence render, measure, look before mark-done; a tutor eval checks claims against fixture evidence ids; an unanswerable question must produce the epistemic cue. |
+| **Guided MCP prompts** | Six provider-neutral workflow prompts (`investigate_feature`, `audit_residual_unknowns`, ...) exposed through MCP `prompts`, plus session-aware argument completion. Prompts suggest starting tools; they do not call them. | `edgent mcp` exposes `build_book`, `tutor_session`, `mock_interview`, `make_assignments`, `audit_unknowns` as prompts, so a host like `agy` gets a workflow entry point even without the skill installed. |
+| **Doctor and setup** | `doctor --client X --json` diagnoses by scope (registration, PATH, engine availability) without changing anything; `setup --client X --dry-run` shows paths, backups and planned changes; changes are additive, idempotent and backed up; never installs unrelated software. | `edgent doctor` and `edgent setup --host agy|claude|codex` behave exactly this way, including the toolchain checks for Manim, TeX, ffmpeg, Chromium, whisper. |
+| **Skill shape** | "Connect only when needed", "route the target first", a recovery ladder with distinct remedies per failure kind, explicit "do not repeat the unchanged call", and references split into focused files. | Edgent's primary skill routes by task (study, build, assess, interview, research) and carries the same ladder for a missing toolchain: continue the useful work, record the unknown, never block the book on a film. |
+| **Evaluation environments from captures** | Recorded behaviour served back as an MCP environment, so an agent can be evaluated against retained evidence without touching the live target. | Record a session's tool results as a fixture environment; evals replay the workspace without renderers or a live model. |
+
+What is deliberately not taken: REA's size (about 2,800 TypeScript files and
+forty provider adapters), its process-ownership and cleanup machinery, and
+anything specific to binaries. Its restraint about scope is the lesson, not
+its surface area.
+
 The twelve principles that fall out:
 
 1. **Thin loop, strong tools.** The model decides; the harness executes, bounds and verifies.
@@ -215,6 +247,9 @@ my-linear-algebra/
     mastery.json       concept -> evidence of mastery, last seen, next review
     misconceptions.md
     history.md
+  evidence/
+    <ev_id>.json       immutable, content-addressed Evidence records (section 1.1): what was observed, derived or inferred, from where, with what authority and limitations
+  unknowns.json        the residual-unknowns ledger: open questions, contradictions, gaps, with required authority and recommended probes
   knowledge/
     house.md           learned preferences (rewritten, capped), the Antigravity knowledge-base analogue
   progress.md          the long-running-agent progress log, appended per build session
@@ -319,7 +354,9 @@ Tool design rules (from "Writing tools for agents" and REA):
 
 - One tool per analyst question, not one per API endpoint. Consolidate multi-step operations.
 - Namespaced names (`book_`, `film_`, `check_`). Unambiguous parameter names.
-- Return high-signal results, paginated or truncated with pointers to the persisted full output. Error messages say what to do instead.
+- Return high-signal results, paginated or truncated with pointers to the persisted full output.
+- Every failure follows the canonical error contract (section 1.1): `code`, `category`, `message`, `retryable`, `remediation.action`, a bounded `recovery` step, and the partial result preserved. The message tells the model what to do instead, and never to repeat the unchanged call.
+- Every ceiling follows the limits-and-recovery rule: a named constant with a unit, a setting with floor and maximum when headroom is legitimate, and a failure text that names the effective value, the next action and what does not raise it.
 - Compact schema profile by default; a `full` profile on request.
 - Every tool has a contract test and appears in the generated `docs/tool-contracts.md`.
 - Token cost of a tool's result is measured in the eval loop; a chatty tool is a bug.
@@ -452,6 +489,8 @@ Education content has more mechanical checks than people assume. Every artifact 
 
 The judge is advisory and last. Where the harness can make the world answer back, it does.
 
+**Obligations, not checklists.** Each unit in `outline.json` derives an obligation ledger (section 1.1): the claims it owes, the case kinds each needs, and the authority a verifier must have to close it. `book_mark_done` reads the ledger, runs the closers, and refuses to close an obligation with a weaker verifier than it requires. An unmet obligation becomes a residual unknown with a recommended probe, and the unit is recorded `partial`, never `done`. The walkthrough artifact at the end of a build is the unknowns ledger rendered for the user.
+
 ---
 
 ## 14. Engineering standards
@@ -461,7 +500,8 @@ The judge is advisory and last. Where the harness can make the world answer back
 - **Typed errors**: a tagged error algebra and `Result` for expected failures; partial facts preserved (a render that produced 18 of 20 beats returns 18 beats and one error).
 - **Contracts first**: tool schemas, skill front matter, artifact schemas and the workspace layout are documented from source (`edgent docs generate`) and checked in CI (`docs:check`).
 - **Tests in this order**: public workflow tests (a whole `edgent build` on a tiny fixture with the mock provider; a tutor session with kill-and-resume), boundary tests against real renderers (skipped when the toolchain is absent, reported as unverified), producer goldens for ingestion, unit tests only for semantics the above cannot reach.
-- **Evals as CI**: `evals/` holds golden tasks per capability (ingest, cite, chapter, film, assessment, recall) with mechanical scoring; results append to a table; a change that regresses tokens or pass rate fails. Separate cold and warm runs; report tokens, time, CPU, peak memory.
+- **Evals as CI**: `evals/` holds golden tasks per capability (ingest, cite, chapter, film, assessment, recall) with mechanical scoring; results append to a table; a change that regresses tokens or pass rate fails. Separate cold and warm runs; report tokens, time, CPU, peak memory. The pass gate is REA's (section 1.1): correct first tool, zero repeated identical calls, zero schema failures, required tool subsequence met, fixture claims backed by evidence of the required confidence and authority, and an epistemic cue where no oracle exists. Fixture environments replay recorded tool results so evals run without renderers or a live model.
+- **Coverage is a producer fact**: ingestion declares what it covered; consumers never infer coverage from prose, and an uncovered region is unknown, not empty.
 - **Observability**: JSONL traces per session, replayable; cost per unit; cache-hit rate; tool error rate; the `edgent trace` viewer.
 - **Conventional commits**, release-please, ADRs under `docs/adr/`, `AGENTS.md` at the root with the rules an agent must follow in this repo (fail closed on scope questions, never commit binaries or credentials, a human owns the final diff).
 - **Security**: sandboxed execution for everything model-written (Manim scenes, probes, widgets, code blocks); scrubbed environment; no ambient credentials in tools; untrusted-data delimiting; `network` and `delete` always prompt unless explicitly allowed.
@@ -510,7 +550,7 @@ Order matters: M3 before M5 means the tool and skill layer is proven under a bat
 - Writing tools for agents: https://www.anthropic.com/engineering/writing-tools-for-agents
 - Google Antigravity (platform): https://developers.googleblog.com/build-with-google-antigravity-our-new-agentic-development-platform/ and https://en.wikipedia.org/wiki/Google_Antigravity
 - Antigravity CLI (`agy`): https://codelabs.developers.google.com/antigravity-cli-hands-on , https://computingforgeeks.com/install-antigravity-cli-linux-macos-windows/
-- REA, Reverse Engineer Anything: https://github.com/morluto/rea (AGENTS.md and docs/architecture.mermaid)
+- REA, Reverse Engineer Anything: https://github.com/morluto/rea (read: `AGENTS.md`, `docs/architecture.mermaid`, `docs/tool-design.md`, `docs/design/limits-and-recovery.md`, `docs/error-contract.schema.json`, `docs/mcp-contracts.md`, `docs/mcp-prompts.md`, `src/domain/evidence.ts`, `src/domain/residualUnknown.ts`, `src/application/investigation/EvidenceLedger.ts`, `src/contracts/compactInputSchema.ts`, `src/evaluation/`, `.agents/skills/reverse-engineer-anything/SKILL.md`)
 - Gemini CLI (open source sibling of `agy`): https://github.com/google-gemini/gemini-cli
 - OpenCode: https://github.com/anomalyco/opencode and https://www.analyticsvidhya.com/blog/2026/09/opencode-ai-explained/
 - OpenClaw architecture: https://clawdocs.org/architecture/overview and https://bibek-poudel.medium.com/how-openclaw-works-understanding-ai-agents-through-a-real-architecture-5d59cc7a4764
