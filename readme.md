@@ -1,7 +1,7 @@
 # Edgent's general purpose harness
 
 A plain-Python (standard library only, Python 3.10+) implementation of the build plan in
-[`TUTORIAL_general_purpose_harness.md`](TUTORIAL_general_purpose_harness.md): a production-style
+[`docs/archive/TUTORIAL_general_purpose_harness.md`](docs/archive/TUTORIAL_general_purpose_harness.md) (superseded by [`docs/HARNESS_ENGINEERING_PRIMER.md`](docs/HARNESS_ENGINEERING_PRIMER.md) and [`docs/EDU_HARNESS_PLAN.md`](docs/EDU_HARNESS_PLAN.md)): a production-style
 multimodal agent harness around a self-hosted model served through an OpenAI-compatible API
 (vLLM or SGLang running Qwen3.8-27B on an H100 is the target, but any compatible server works).
 
