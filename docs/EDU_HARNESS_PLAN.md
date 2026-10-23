@@ -379,12 +379,20 @@ The same protocol makes a video course (units are films and narration), an assig
 
 - **Ask about anything in the workspace** (NotebookLM-like). Answer from `sources/` with citations the UI can click to the page or timestamp; say plainly when the answer goes beyond the sources.
 - **Learning session.** `learning-session` skill plus `learner_schedule`: recall from the queue, new material (a chapter, a film), practice items from `examiner`, reflection; the `observer` updates mastery.
-- **Mock interview.** `mock-interview` skill drives rounds; the transcript is scored against the rubric; the debrief is an artifact; weaknesses become spaced-repetition items.
+- **Mock interview.** Runs over the workspace ("interview me on chapter 7", "viva for this thesis", "ML role, this resume"), so questions are grounded in the sources. Four formats under one skill: technical (code runs in the sandbox), oral exam or viva, behavioural (STAR follow-up ladders), and teach-back. Fixed structure: setup, rounds with escalating follow-ups, hard stop, then a debrief artifact with a score per rubric row, the quoted moments that cost points, model answers, and three things to practise. Scoring is done by a separate-context critic, not the interviewer. Weak answers become spaced-repetition items and `learner/misconceptions.md` entries, so the next learning session starts there. Typed in v1; spoken in v2.
 - **Personalised assignments.** `examiner` reads mastery and misconceptions, writes items at the right difficulty, keys them mechanically where possible, renders them.
 - **Reading companion.** The local web UI shows the chapter with the chat beside it; "this" resolves to what is on screen (selection and visible section ids are sent with the message).
 - **Voice.** Optional on-device STT and TTS adapters; the tutor's spoken register comes from the `narration` skill.
 
 All of it is the same loop with the same tools; only the skill invoked and the system context block differ.
+
+### 11.1 Feature cut
+
+In for v1: workspace and ingestion with locators; tutor chat with clickable citations; book and course builds with the done-gate; assessments with verified keys, personalised from the learner model; learning sessions with spaced repetition; typed mock interviews; diagrams and widgets verified in Chromium; Manim films gated behind `edgent doctor`.
+
+Deferred to v2: voice in and out (worth it for interviews and read-aloud, but heavy); narrated video assembly with TTS; a desktop shell (the local web UI covers it until the core is stable).
+
+Out permanently: anything multi-user (cohorts, sharing, accounts, gateways, tunnels); embeddings and vector indexes; gamification; LMS and classroom integrations; real-time collaboration.
 
 ---
 
