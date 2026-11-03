@@ -467,9 +467,20 @@ def diagram_render(ctx: ToolContext, a: dict[str, Any]) -> dict[str, Any]:
         "ok": counts["error"] == 0,
         "untrusted": True,
     }
+    out["defects_path"] = _write_defects(ctx, svg_path, out)
     if png_path:
         out["_attach"] = [{"type": "image", "path": png_path, "text": f"[diagram {diagram_id} rendered at {size['width']}x{size['height']}]" if size else f"[diagram {diagram_id}]"}]
     return out
+
+
+def _write_defects(ctx: ToolContext, artifact: Any, out: dict[str, Any]) -> str | None:
+    """<artifact>.defects.json beside a diagram or widget, so a critic without the tool result can re-examine the measurements."""
+    try:
+        path = Path(str(artifact)).with_suffix(Path(str(artifact)).suffix + ".defects.json")
+        write_json(path, {k: v for k, v in out.items() if k not in ("_attach",)} | {"written_at": now_iso()})
+        return _rel(ctx, path)
+    except Exception:  # noqa: BLE001 - the measurements are still in the result; the side file is a convenience
+        return None
 
 
 def build_widget_document(html: str, css: str = "", js: str = "", title: str = "") -> str:
@@ -539,6 +550,7 @@ def widget_run(ctx: ToolContext, a: dict[str, Any]) -> dict[str, Any]:
         "ok": counts["error"] == 0,
         "untrusted": True,
     }
+    out["defects_path"] = _write_defects(ctx, html_path, out)
     if screenshot:
         out["_attach"] = [{"type": "image", "path": screenshot, "text": f"[widget {widget_id} screenshot at {width}x{height}]"}]
     return out

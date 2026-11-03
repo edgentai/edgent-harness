@@ -93,7 +93,7 @@ ITEM_SET_SCHEMA: dict[str, Any] = {
                         "properties": {
                             "type": {"enum": list(VERIFY_TYPES)},
                             "expression": {"type": "string", "description": "numeric: a Python expression (math is available) that evaluates to the answer"},
-                            "code": {"type": "string", "description": "code: Python that asserts over a variable named answer"},
+                            "code": {"type": "string", "description": "code: Python that asserts over a variable named answer, which holds the submitted source as a string (the reference code when the key is checked); exec it or inspect it, never call it"},
                             "pattern": {"type": "string", "description": "regex: fullmatch against the trimmed response, case-insensitive"},
                         },
                     },
@@ -107,7 +107,9 @@ EXAMINER_SYSTEM = (
     "You write assessment items for stated learning objectives. Reply with one JSON object and nothing else, "
     "matching the schema exactly. Keys must be computable wherever the kind allows: numeric items carry "
     "verify.expression (a Python expression that evaluates to the answer); code items carry verify.code (Python "
-    "that asserts over a variable named answer); short items carry verify.pattern when a regular expression can "
+    "that asserts over a variable named answer, which is the submitted source as a STRING: exec it into a namespace "
+    "or inspect it, never call it; the key is checked by binding answer to the reference code); short items carry "
+    "verify.pattern when a regular expression can "
     "recognise a correct answer, otherwise verify.type is 'none'. MCQ options are distinct and plausible, exactly "
     "one is correct, and answer is that option's integer index. Difficulty runs from 1 (recall) to 5 (transfer). "
     "Every item names the concept it tests."

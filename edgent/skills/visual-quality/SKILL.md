@@ -155,8 +155,9 @@ After the three ops, re-render beat 3 with `only: [3]`, confirm an empty list, r
 ## Reviewing someone else's render (as critic)
 
 Read the measurements first, then look: a film keeps them in `media/films/<id>/defects.json` and `film_look`
-shows the frames; a diagram or widget writes nothing beside its file, so its measurements and its picture come
-from the tool's result, which the task must hand you (say so when it did not). Report each defect with its
+shows the frames; a diagram or widget keeps its last tool result beside its file, in `<file>.defects.json`
+(the defects, counts and measurements), and its picture is the `.png` or screenshot beside it; read both with
+`read_file` (say so when they are missing). Report each defect with its
 location (beat id, element, line), its family, and the fix; high when it misleads (wrong emphasis, wrong value,
 ambiguous arrow), medium when it costs clarity (clutter, order, a weak title), low for polish. Do not report
 taste. Do not edit.
