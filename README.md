@@ -74,7 +74,7 @@ A workspace can hold a codebase too: the same `read_file`, `edit_file`, `grep`, 
 
 **Conversation.** `edgent chat`, `edgent run` and the web reader run one agent loop per turn: the context is assembled in cache-aware order (system prompt and behaviour spec, the role, the skills and subagent indexes, the workspace instructions, then the volatile orientation and the transcript), the model calls tools until it answers in prose, and the transcript is persisted before every model call. Long sessions are compacted in tiers (old tool results are cleared first, then blocks become notes, then notes roll up); anything verbatim is still recoverable with `session_recall`.
 
-**Build.** `edgent build` plans an outline (an initializer session proposes units with objectives, dependencies and paths), then runs ready units in worker sessions. A unit is done only when its obligations close with evidence: the code in it ran and produced the expected output, every citation resolves, the page renders and measures clean, prerequisites were introduced earlier. The gate, not the worker, moves a unit to `done`; a separate-context critic reviews new units and opens fix units for high-severity defects. Every status change is on disk and committed before the next step, so a crash or a closed laptop resumes from `outline.json`.
+**Build.** `edgent build` plans an outline (an initializer session proposes units with objectives, dependencies and paths), shows it and asks before the workers start (`--plan-only` stops there, `--yes` skips the question), then runs ready units in worker sessions; one build at a time per workspace, guarded by `.edgent/build.lock`. A unit is done only when its obligations close with evidence: the code in it ran and produced the expected output, every citation resolves, the page renders and measures clean, prerequisites were introduced earlier. The gate, not the worker, moves a unit to `done`; a separate-context critic reviews new units and opens fix units for high-severity defects. Every status change is on disk and committed before the next step, so a crash or a closed laptop resumes from `outline.json`.
 
 ## Skills, agents, prompts
 
@@ -95,7 +95,7 @@ Pedagogy and craft live in Markdown, not in code. `edgent/skills/` holds fifteen
 }
 ```
 
-Permission modes are `ask` (writes and commands need approval), `accept-edits`, `auto` (everything but the network and deletes), `plan` (read-only) and `bypass`. Every ceiling is a named limit with a unit; a failure message says the effective value and the next action.
+Permission modes are `ask` (writes and commands need approval), `accept-edits` (writes inside the workspace go ahead, commands and the network ask), `auto` (everything but the network and deletes), `plan` (read-only) and `bypass`. `edgent chat` and `edgent run --interactive` ask on the console; `edgent run` without a console and the web reader have nobody to ask, so they use `accept-edits` unless a mode is configured. A `bash` call that asks for the network is judged as a network request. Writes into `.edgent/` (settings, hooks, skills, agents) always ask: the model never widens its own permissions. Deny patterns on `bash` match every command in a shell line, not only its start. Every ceiling is a named limit with a unit; a failure message says the effective value and the next action.
 
 ## Hosting the tools elsewhere
 

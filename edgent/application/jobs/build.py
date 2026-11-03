@@ -9,6 +9,8 @@ the gate, the outline and git are serialised behind one lock.
 from __future__ import annotations
 
 import concurrent.futures
+import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -23,6 +25,7 @@ from .briefs import initializer_brief, worker_brief
 
 MAX_PARALLEL_LIMIT = Limit("build parallel units", 8, "units", does_not_raise=("the provider's concurrency, which bounds it in practice",))
 MAX_ROUNDS_LIMIT = Limit("build rounds per unit", 5, "rounds")
+LOCK_FILE = "build.lock"  # under .edgent: the pid of the process running a build; a second build over the same workspace refuses
 ERROR_TEXT_CHARS = 300
 DEFAULT_CRITIC_RUBRIC = "motivation before definition; example density; notation discipline; each section ends with what the reader can now do; no unexplained jargon for the persona"
 
@@ -300,8 +303,39 @@ class BuildJob:
             self._event("fix_unit", unit_id=fix.id, fix_for=target_id, defects=len(high))
         return created
 
+    def _acquire_lock(self) -> Any:
+        """Create .edgent/build.lock exclusively; a live owner means another build is running, a dead one is taken over."""
+        path = self.workspace.path("state") / LOCK_FILE
+        for _attempt in range(2):
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                try:
+                    owner = json.loads(path.read_text(encoding="utf-8") or "{}")
+                    pid = int(owner.get("pid", 0))
+                except (OSError, ValueError, TypeError):
+                    pid = 0
+                if pid and pid != os.getpid() and _pid_alive(pid):
+                    raise RuntimeError(f"another build (pid {pid}) is running on this workspace; wait for it or remove {path} if it is dead") from None
+                path.unlink(missing_ok=True)  # stale: the owner is gone
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"pid": os.getpid(), "session_id": self.session_id, "started_at": time.time()}, fh)
+            return path
+        raise RuntimeError(f"could not take the build lock at {path}")
+
     def run(self, max_units: int | None = None, stop_on_error: bool = False) -> BuildReport:
         """Run ready units (in parallel when independent) through the gate until nothing is ready or a cap is hit."""
+        lock = self._acquire_lock()
+        try:
+            return self._run(max_units, stop_on_error)
+        finally:
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _run(self, max_units: int | None, stop_on_error: bool) -> BuildReport:
         t0 = time.monotonic()
         report = BuildReport()
         self._recover_interrupted()
@@ -385,3 +419,13 @@ class BuildJob:
         except Exception:  # noqa: BLE001 - the text is still returned
             pass
         return text
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

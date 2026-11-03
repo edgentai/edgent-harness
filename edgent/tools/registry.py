@@ -484,11 +484,12 @@ class ToolRegistry:
         self._trace(ctx, res, arguments)
         return res
 
-    def call_parallel(self, calls: list[tuple[str, dict[str, Any], str | None]], ctx: ToolContext, allowlist: set[str] | None = None) -> list[ToolResult]:
-        """Independent calls dispatched together; order of results matches order of calls."""
+    def call_parallel(self, calls: list[tuple[str, dict[str, Any], str | None]], ctx: ToolContext, allowlist: set[str] | None = None, key_scope: str = "") -> list[ToolResult]:
+        """Independent calls dispatched together; order of results matches order of calls. ``key_scope`` (the loop passes the
+        turn) keeps a server that reuses call ids across turns from ever replaying an earlier turn's result."""
         # The replay key is the model's call id together with the call itself: a resumed turn that re-sends the
         # same call replays, while a server that reuses ids across turns (call_0, call_1, ...) never gets a stale result.
-        keyed = [(n, a, cid, f"{cid}:{n}:{json_dumps(a)}" if cid else None) for n, a, cid in calls]
+        keyed = [(n, a, cid, f"{key_scope}{cid}:{n}:{json_dumps(a)}" if cid else None) for n, a, cid in calls]
         if len(keyed) == 1:  # the common case runs on the caller's thread and costs no dispatch worker
             n, a, cid, key = keyed[0]
             return [self.call(n, a, ctx, allowlist, key, cid)]

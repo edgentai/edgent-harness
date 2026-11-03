@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import threading
 import webbrowser
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.errors import ConfigurationError
+from ..domain.outline import OutlineError
 from ..domain.workspace import Workspace
 
 PROVIDERS = ("gemini", "openai", "agy", "claude", "mock")
@@ -31,6 +33,7 @@ EFFORTS = ("low", "medium", "high")
 MODES = ("ask", "accept-edits", "auto", "plan", "bypass")
 HOSTS = ("agy", "claude", "codex", "cursor", "generic")
 PREVIEW_CHARS = 160
+RUN_DEFAULT_MODE = "accept-edits"  # `edgent run` without --interactive has no one to ask; writes inside the workspace are allowed
 
 
 def _app(args: argparse.Namespace, create: bool = False) -> Any:
@@ -115,6 +118,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.interactive:
         kw["ask_user"] = _console_ask_user
         kw["ask_permission"] = _console_ask_permission
+    elif not getattr(args, "mode", None) and "mode" not in app.settings:
+        kw["permission_mode"] = RUN_DEFAULT_MODE  # nobody can answer a prompt: workspace writes go ahead, commands and the network do not
     session, result = app.chat(args.task, session_id=args.session, parts=_attachments(args.attach), **kw)
     _print_result(result, args.json)
     print(f"session: {session.session_id}", file=sys.stderr)
@@ -156,7 +161,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
             print(json.dumps(app.outline().summary(), indent=2))
             continue
         if text.startswith("/recall "):
-            for hit in session.recall(text[len("/recall "):].strip()):
+            try:
+                hits = session.recall(text[len("/recall "):].strip())
+            except (ValueError, re.error) as e:
+                print(f"recall failed: {e}", file=sys.stderr)
+                continue
+            for hit in hits:
                 print(json.dumps(hit, default=str)[:300])
             continue
         result = loop.run_turn(text, extra_context={"learner_summary": app.learner_summary()})
@@ -174,22 +184,41 @@ def cmd_build(args: argparse.Namespace) -> int:
     if args.unblock:
         job = app.build_job(on_event=on_event)
         for uid in args.unblock:
-            unit = job.unblock(uid)
+            try:
+                unit = job.unblock(uid)
+            except OutlineError as e:
+                print(f"cannot unblock {uid}: {e}", file=sys.stderr)
+                return 2
             print(f"unit {unit.id}: {unit.status}", file=sys.stderr)
     if args.goal and not outline.units:
         print("planning the outline...", file=sys.stderr)
-        app.plan_build(args.goal, on_event=on_event)
+        try:
+            app.plan_build(args.goal, on_event=on_event)
+        except ValueError as e:
+            print(f"planning failed: {e}\nThe initializer session is saved (edgent sessions); refine the goal or add sources and try again.", file=sys.stderr)
+            return 2
         outline = app.outline()
         print(outline.render_markdown(), file=sys.stderr)
-        if args.plan_only:
-            return 0
     elif not outline.units:
         print('no outline yet; give a goal: edgent build "a 100-page book on ..."', file=sys.stderr)
         return 2
     elif args.goal:
         print(f"an outline with {len(outline.units)} units exists; resuming it (the goal is kept for the record)", file=sys.stderr)
+    if args.plan_only:
+        if not args.goal:
+            print(outline.render_markdown(), file=sys.stderr)
+        return 0
+    if not args.yes and sys.stdin.isatty():  # a person at the keyboard approves the plan before the workers start
+        ans = input(f"run the build over {len(outline.units)} units now? [Y/n] ").strip().lower()
+        if ans not in ("", "y", "yes"):
+            print("not started; the outline is saved. Edit it with `edgent outline` in mind and run `edgent build` again.", file=sys.stderr)
+            return 1
     job = app.build_job(on_event=on_event, max_parallel=args.parallel, max_rounds=args.rounds)
-    report = job.run(max_units=args.max_units, stop_on_error=args.stop_on_error)
+    try:
+        report = job.run(max_units=args.max_units, stop_on_error=args.stop_on_error)
+    except RuntimeError as e:  # another build holds the lock
+        print(f"build not started: {e}", file=sys.stderr)
+        return 2
     print(json.dumps(report.to_dict(), indent=2, default=str))
     print(job.walkthrough(), file=sys.stderr)
     return 0 if report.ok else 1
@@ -210,7 +239,11 @@ def cmd_trace(args: argparse.Namespace) -> int:
     from ..observability import TraceReader
 
     app = _app(args)
-    reader = TraceReader(str(app.workspace.path("traces") / f"{args.session_id}.jsonl"))
+    path = app.workspace.path("traces") / f"{args.session_id}.jsonl"
+    if not path.exists():
+        print(f"no trace for session {args.session_id!r} (looked at {path}); `edgent sessions` lists the ids", file=sys.stderr)
+        return 2
+    reader = TraceReader(str(path))
     if args.summary:
         print(json.dumps(reader.summary(), indent=2))
         return 0
@@ -363,8 +396,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     token = None if args.no_token else LocalServer.new_token()
     server = LocalServer(service, port=args.port, token=token)
     print(f"Edgent UI at {server.url}", file=sys.stderr)
-    if args.heartbeat:
-        service.start_heartbeat()
+    if args.heartbeat and not service.start_heartbeat():
+        print('no heartbeat configured: add {"heartbeat": {"times": ["07:30"], "prompt": "..."}} to .edgent/settings.json', file=sys.stderr)
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(server.url)).start()
     try:
@@ -452,7 +485,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-units", type=int)
     p.add_argument("--parallel", type=int, default=1)
     p.add_argument("--rounds", type=int, default=2, help="fix rounds per unit after the critic (max 5)")
-    p.add_argument("--plan-only", action="store_true")
+    p.add_argument("--plan-only", action="store_true", help="plan (or show) the outline and stop")
+    p.add_argument("--yes", "-y", action="store_true", help="start the workers without asking")
     p.add_argument("--no-critic", action="store_true", help="skip the separate-context critic after units become done")
     p.add_argument("--stop-on-error", action="store_true")
     p.add_argument("--unblock", action="append", metavar="UNIT", help="reset a blocked unit to pending before running (repeatable)")

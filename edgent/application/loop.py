@@ -193,7 +193,13 @@ class AgentLoop:
                 self._record_reply(reply)
                 if reply.tool_calls:
                     self._run_tools(reply.tool_calls)
-                elif not self._feedback_parse_errors(reply):
+                    self._feedback_parse_errors(reply)  # a sibling call that did not parse is reported next to the results
+                elif self._feedback_parse_errors(reply):
+                    pass
+                else:
+                    if reply.finish_reason == "length":
+                        self._note_error("the reply was cut by the output limit (finish_reason=length); the answer may be incomplete")
+                        self._emit({"type": "warning", "session_id": self.session.session_id, "text": "reply cut by the output limit"})
                     break
                 if self.budget.iterations >= self.budget.budget.max_iterations:
                     stop_reason = "max_iterations"
@@ -230,7 +236,8 @@ class AgentLoop:
             try:
                 return self.provider.complete(request)
             except ProviderError as e:
-                if e.category == ErrorCategory.truncated and not compacted:
+                compactable = bool((getattr(e.error, "details", None) or {}).get("compactable", True))  # a media or system-prompt ceiling is not helped by dropping history
+                if e.category == ErrorCategory.truncated and not compacted and compactable:
                     compacted = True
                     self._compact(force=True, reason="provider refused the prompt size")
                     request = self._build_request(extra_context, allow_compaction=False)
@@ -307,7 +314,7 @@ class AgentLoop:
         ctx = self.tool_context()
         planned = [self._pre_tool(tc) for tc in tool_calls]
         calls = [(tc.name, args, tc.id) for tc, args, blocked in planned if blocked is None]
-        ran = iter(self.registry.call_parallel(calls, ctx, self.allowlist) if calls else [])
+        ran = iter(self.registry.call_parallel(calls, ctx, self.allowlist, key_scope=f"turn{self.session.seq}:") if calls else [])
         results: list[ToolResult] = []
         for tc, args, blocked in planned:
             result = ToolResult(tc.id, tc.name, False, None, blocked) if blocked is not None else next(ran)

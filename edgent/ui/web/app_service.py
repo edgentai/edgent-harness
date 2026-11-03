@@ -8,6 +8,7 @@ from typing import Any
 from ...adapters.markdown import markdown_to_html
 
 CHAPTER_HEAD_CHARS = 2000  # how much of a chapter is read to find its title (chars)
+DEFAULT_UI_MODE = "accept-edits"  # the reader has no permission prompt: workspace writes are allowed, commands and the network are not
 
 
 class AppService:
@@ -54,7 +55,8 @@ class AppService:
                 extra["screen"] = screen
                 if screen.get("chapter"):
                     extra["subdir"] = str(Path(str(screen["chapter"])).parent)
-            _, result = self.app.chat(text, session_id=session_id, extra_context=extra)
+            mode = None if (self.app.config.mode or "mode" in self.app.settings) else DEFAULT_UI_MODE
+            _, result = self.app.chat(text, session_id=session_id, extra_context=extra, permission_mode=mode)
             d = result.to_dict()
             d["session_id"] = session_id
             return d

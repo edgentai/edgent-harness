@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..adapters.providers.base import Provider
@@ -27,6 +27,7 @@ from ..tools.registry import AllowAll, IdempotencyStore, ToolContext, ToolRegist
 EVENT_BUFFER_MAX = 500  # progress events kept for UI polling (count)
 EVENT_DETAIL_CHARS = 300  # longest event detail kept (chars)
 WORKER_STATUS = {"done": "done", "max_iterations": "partial", "budget": "partial", "cancelled": "error", "error": "error"}
+BUILD_NETWORK_TOOLS = ("web_fetch", "web_search", "sources_add_url")  # research units need them and a build has nobody to ask
 JUDGEABLE_SUFFIXES = (".md", ".markdown", ".txt")
 
 
@@ -79,6 +80,8 @@ class App:
         self._events: list[dict[str, Any]] = []
         self._events_lock = threading.Lock()
         self._seq = 0
+        self._tracers: dict[str, Tracer] = {}
+        self._tracers_lock = threading.Lock()
 
     # ------------------------------------------------------------------ construction
     @classmethod
@@ -135,7 +138,17 @@ class App:
         return prompts.build_system_prompt(role, mode=mode, caps=self.provider.caps, extra=extra)
 
     def tracer(self, session_id: str) -> Tracer:
-        return Tracer(self.workspace.path("traces"), session_id)
+        """One tracer per session id for the life of the app, so seq numbers in a trace file stay monotonic."""
+        with self._tracers_lock:
+            tracer = self._tracers.get(session_id)
+            if tracer is None:
+                tracer = self._tracers[session_id] = Tracer(self.workspace.path("traces"), session_id)
+            return tracer
+
+    def build_allow(self) -> list[str]:
+        """Patterns a build session may use without anyone to ask: the network tools, unless settings.build.network is false."""
+        build = self.settings.get("build") if isinstance(self.settings.get("build"), dict) else {}
+        return list(BUILD_NETWORK_TOOLS) if build.get("network", True) else []
 
     # ------------------------------------------------------------------ progress events (for UIs polling a process)
     def emit(self, event: dict[str, Any]) -> None:
@@ -182,19 +195,24 @@ class App:
         permission_mode: str | None = None,
         allowlist: set[str] | None = None,
         effort: str | None = None,
+        allow: list[str] | None = None,
     ) -> Any:
         from .compaction import Compactor
         from .context import ContextAssembler
         from .loop import AgentLoop
+        from .permissions import Permissions
 
         tracer = self.tracer(session.session_id)
+        permissions = self.permissions(permission_mode)
+        if allow:
+            permissions = Permissions(permissions.mode, [*map(str, permissions.allow), *allow], [*map(str, permissions.deny)], self.workspace, permissions.always_ask)
         return AgentLoop(
             self.provider,
             self.registry,
             self.workspace,
             session,
             system_prompt=self.system_prompt(role, mode, system_extra),
-            permissions=self.permissions(permission_mode),
+            permissions=permissions,
             hooks=self.hooks(tracer),
             budget=self.budget(),
             tracer=tracer,
@@ -274,14 +292,24 @@ class App:
         from ..tools.edu.book import mark_unit_done
         from .jobs.build import BuildJob, UnitOutcome
 
-        events = self._chain(on_event)
+        hooks = self.hooks(self.tracer("build"))
+        chained = self._chain(on_event)
+
+        def events(event: dict[str, Any]) -> None:
+            chained(event)
+            kind = event.get("event")
+            if kind == "unit_finished" and hooks.has("UnitDone"):
+                hooks.run("UnitDone", dict(event))
+            elif kind in ("run_finished", "unit_blocked", "critic_exhausted") and hooks.has("Notification"):
+                hooks.run("Notification", {"event": kind, **{k: v for k, v in event.items() if k != "event"}})
 
         def run_unit(unit: Any, brief: str) -> UnitOutcome:
             session = self.new_session("build", title=f"unit {unit.id}")
             session.meta["unit_id"] = unit.id
             session.save()
-            loop = self.loop(session, role="worker", mode="build", on_event=on_event, permission_mode="auto")
-            result = loop.run_turn(brief)
+            loop = self.loop(session, role="worker", mode="build", on_event=on_event, permission_mode="auto", allow=self.build_allow())
+            subdir = str(PurePosixPath(unit.path).parent) if unit.path else None  # the nearest STUDY.md wins for the unit's folder
+            result = loop.run_turn(brief, extra_context={"subdir": subdir} if subdir and subdir != "." else None)
             status = WORKER_STATUS.get(result.stop_reason, "error")
             error = None
             if status != "done":
@@ -321,7 +349,7 @@ class App:
 
         def propose(brief: str) -> list[dict[str, Any]] | dict[str, Any]:
             session = self.new_session("build", title="initializer")
-            loop = self.loop(session, role="initializer", mode="build", on_event=on_event, permission_mode="auto")
+            loop = self.loop(session, role="initializer", mode="build", on_event=on_event, permission_mode="auto", allow=self.build_allow())
             result = loop.run_turn(brief)
             data = extract_json(result.text)
             if isinstance(data, dict) and isinstance(data.get("units"), list):

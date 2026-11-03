@@ -15,7 +15,8 @@ from ..domain.types import ToolCall
 from ..domain.utils import IdGenerator, extract_json, json_dumps
 
 _ids = IdGenerator()
-_BLOCK_RE = re.compile(r"```tool[ \t]*\n(.*?)```", re.DOTALL)
+_OPEN_RE = re.compile(r"^[ \t]*```tool[ \t]*(.*)$")  # the tag line; JSON may start on the same line
+_CLOSE_RE = re.compile(r"^[ \t]*```[ \t]*$")  # a closing fence is a line of its own: fences inside JSON strings never are
 
 PROTOCOL_INSTRUCTIONS = """## Tool calls (text protocol)
 
@@ -56,6 +57,10 @@ def _type_of(schema: dict[str, Any]) -> str:
         return "|".join(str(x) for x in schema["enum"])
     if t == "array":
         return f"{_type_of(schema.get('items') or {})}[]"
+    if t == "object" and isinstance(schema.get("properties"), dict):
+        required = set(schema.get("required") or [])
+        inner = ", ".join(f"{k}{'' if k in required else '?'}: {_type_of(v)}" for k, v in schema["properties"].items() if isinstance(v, dict))
+        return "{" + inner + "}"
     return str(t or "any")
 
 
@@ -93,9 +98,23 @@ def parse_tool_calls(text: str) -> tuple[str, list[ToolCall], list[str]]:
         else:
             one(data)
 
-    for m in _BLOCK_RE.finditer(text or ""):
-        handle(m.group(1))
-    clean = _BLOCK_RE.sub("", text or "").strip()
+    kept: list[str] = []
+    block: list[str] | None = None
+    for line in (text or "").splitlines():
+        if block is None:
+            m = _OPEN_RE.match(line)
+            if m:
+                block = [m.group(1)] if m.group(1).strip() else []
+            else:
+                kept.append(line)
+        elif _CLOSE_RE.match(line):
+            handle("\n".join(block))
+            block = None
+        else:
+            block.append(line)
+    if block is not None:  # the model stopped before closing the fence: parse what is there rather than lose the call
+        handle("\n".join(block))
+    clean = "\n".join(kept).strip()
     return clean, calls, errors
 
 

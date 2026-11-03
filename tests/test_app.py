@@ -73,9 +73,9 @@ def test_build_job_runs_a_worker_through_the_gate(tmp_path, home):
     report = app.build_job().run(max_units=1)
     assert report.units_run == ["chapter-vectors"] and not report.errors and not report.blocked, report.to_dict()
     unit = app.outline().get("chapter-vectors")
-    assert unit.status in ("done", "partial"), unit.to_dict()
-    assert not any(o.get("kind") in ("execute",) for o in unit.open_obligations), unit.open_obligations  # the code block ran
+    assert unit.status == "done" and report.done == ["chapter-vectors"] and unit.open_obligations == [], unit.to_dict()  # the gate closed every obligation
     assert (ws.root / "book/chapters/01-vectors.md").read_text(encoding="utf-8") == CHAPTER
+    assert any(o.get("kind") == "execute" and o.get("status") == "closed" for o in unit.obligations) if hasattr(unit, "obligations") else True
     assert "unit chapter-vectors" in ws.progress_tail(20)
     kinds = {e["kind"] for e in app.events()}
     assert {"unit_start", "unit_finished", "run_finished", "tool_call"} <= kinds

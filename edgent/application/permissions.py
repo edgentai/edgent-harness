@@ -23,6 +23,10 @@ MODES = ("ask", "accept-edits", "auto", "plan", "bypass")
 DEFAULT_ALWAYS_ASK = frozenset({"network", "delete"})
 AUTO_ALLOWED_CLASSES = frozenset({"read", "compute", "write", "spawn", "interactive"})
 PATH_LIKE_ARGS = ("path", "pattern", "out_path", "paths")
+CONTROL_PLANE_DIR = ".edgent"  # settings, hooks, skills and agents: the model never changes its own permissions without a person
+HARNESS_OWNED_SUBDIRS = ("traces", "tool-results", "cache")  # under .edgent, written by the harness itself
+NETWORK_ESCALATION_ARGS = ("allow_network",)  # a compute tool asking for the network is judged as a network tool
+_SHELL_SPLIT_RE = re.compile(r"[;&|\n`]|\$\(")  # command separators; a deny pattern must match every segment it could run as
 
 SUBJECT_KEYS: dict[str, tuple[str, ...]] = {
     "bash": ("command",),
@@ -37,6 +41,11 @@ SUBJECT_KEYS: dict[str, tuple[str, ...]] = {
 WEB_KEYS = ("url", "query")
 
 _PATTERN_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*(?:\((.*)\))?\s*$", re.DOTALL)
+
+
+def shell_segments(command: str) -> list[str]:
+    """The simple commands a shell line could run: `x; rm -rf .` must not slip past a `bash(rm *)` deny because it starts with x."""
+    return [seg.strip() for seg in _SHELL_SPLIT_RE.split(command or "") if seg.strip()]
 
 
 def subject_of(tool_name: str, args: dict[str, Any]) -> str:
@@ -127,17 +136,23 @@ class Permissions:
 
     # ------------------------------------------------------------------ decision
     def decide(self, spec: ToolSpec, args: dict[str, Any]) -> Decision:
-        subject = subject_of(spec.name, args if isinstance(args, dict) else {})
-        if any(p.matches(spec.name, subject) for p in self.deny):
+        args = args if isinstance(args, dict) else {}
+        subject = subject_of(spec.name, args)
+        subjects = [subject, *shell_segments(subject)] if spec.name.lower() == "bash" else [subject]
+        if any(p.matches(spec.name, s) for p in self.deny for s in subjects):
             return "deny"
         if any(p.matches(spec.name, subject) for p in self.allow):
             return "allow"
         perm = spec.permission
+        if perm == "compute" and any(args.get(k) is True for k in NETWORK_ESCALATION_ARGS):
+            perm = "network"
         if self.mode == "bypass":
             return "allow"
         if self.mode == "plan":
             return "allow" if perm == "read" else "deny"
         if perm in self.always_ask:
+            return "ask"
+        if perm in ("write", "delete", "compute") and self.touches_control_plane(args):
             return "ask"
         if self.mode == "auto":
             return "allow" if perm in AUTO_ALLOWED_CLASSES and self.inside_workspace(args) else "ask"
@@ -146,6 +161,23 @@ class Permissions:
         if self.mode == "accept-edits" and perm == "write":
             return "allow" if self.inside_workspace(args) else "ask"
         return "ask"
+
+    def touches_control_plane(self, args: dict[str, Any]) -> bool:
+        """True when a path-like argument points into the workspace's .edgent directory (settings, hooks, skills, agents)."""
+        if self.workspace is None:
+            return False
+        for key in PATH_LIKE_ARGS:
+            v = args.get(key) if isinstance(args, dict) else None
+            values = [v] if isinstance(v, str) else [x for x in (v or []) if isinstance(x, str)] if isinstance(v, list) else []
+            for value in values:
+                try:
+                    rel = self.workspace.relpath(self.workspace.resolve(value))
+                except (WorkspaceError, ValueError):
+                    continue
+                parts = rel.replace("\\", "/").split("/")
+                if parts and parts[0] == CONTROL_PLANE_DIR and not (len(parts) > 1 and parts[1] in HARNESS_OWNED_SUBDIRS):
+                    return True
+        return False
 
     def inside_workspace(self, args: dict[str, Any]) -> bool:
         """True when every path-like argument resolves inside the workspace (no path-like argument counts as inside)."""
