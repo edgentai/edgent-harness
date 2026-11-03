@@ -116,10 +116,10 @@ class _MD(HTMLParser):
             self.out.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if self.skip:
-            return
         if self._in_title:
             self.title += data
+            return
+        if self.skip:
             return
         if self.pre:
             self.out.append(data)
