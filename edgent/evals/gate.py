@@ -117,6 +117,11 @@ def _subsequence(needles: list[str], haystack: list[str]) -> bool:
 def evaluate(scenario: Scenario, events: list[TraceEvent], final_text: str, evidence: EvidenceStore | None, stop_reason: str = "done") -> GateResult:
     tool_events = [e for e in events if e.kind == "tool_call" and not e.data.get("replayed")]
     names = [e.data.get("name", "?") for e in tool_events]
+    # The order the main agent chose its tools in: a subagent's calls finish (and are traced) before the parent's
+    # `agent` call does, so the first and the required sequence are read from the main agent's model replies.
+    main_names = [str(n) for e in events if e.kind == "model_call" and not e.node_id for n in (e.data.get("tool_calls") or [])]
+    if not main_names:
+        main_names = list(names)
     seen: set[str] = set()
     repeated = 0
     for e in tool_events:
@@ -135,11 +140,11 @@ def evaluate(scenario: Scenario, events: list[TraceEvent], final_text: str, evid
 
     check("exit_ok", stop_reason == "done", f"stop_reason={stop_reason}")
     if scenario.expected_first_tool is not None:
-        check("correct_first_tool", bool(names) and names[0] == scenario.expected_first_tool, f"first={names[0] if names else None}, expected={scenario.expected_first_tool}")
+        check("correct_first_tool", bool(main_names) and main_names[0] == scenario.expected_first_tool, f"first={main_names[0] if main_names else None}, expected={scenario.expected_first_tool}")
     check("no_repeated_calls", repeated == 0, f"repeated={repeated}")
     check("no_validation_failures", validation_failures == 0, f"invalid_input={validation_failures}")
     if scenario.required_subsequence:
-        check("required_subsequence", _subsequence(scenario.required_subsequence, names), f"calls={names}")
+        check("required_subsequence", _subsequence(scenario.required_subsequence, main_names), f"calls={main_names}")
     if scenario.forbidden_tools:
         used = sorted(set(names) & set(scenario.forbidden_tools))
         check("no_forbidden_tools", not used, f"used={used}")

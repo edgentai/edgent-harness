@@ -93,11 +93,18 @@ def test_permissions(workspace, ctx):
 
 def test_idempotency_and_replay(workspace, ctx):
     reg, counter = make_registry(workspace)
-    r1 = reg.call("write_thing", {"k": "a"}, ctx)
-    r2 = reg.call("write_thing", {"k": "a"}, ctx)
+    r1 = reg.call("write_thing", {"k": "a"}, ctx, idempotency_key="call-1")
+    r2 = reg.call("write_thing", {"k": "a"}, ctx, idempotency_key="call-1")
     assert r1.output["count"] == 1 and r2.output["count"] == 1 and r2.replayed and counter["n"] == 1
-    r3 = reg.call("write_thing", {"k": "b"}, ctx)
-    assert r3.output["count"] == 2
+    r3 = reg.call("write_thing", {"k": "a"}, ctx)  # no key: the same arguments run again (the file may have changed)
+    assert r3.output["count"] == 2 and not r3.replayed
+    r4 = reg.call("write_thing", {"k": "a"}, ctx, idempotency_key="call-2")
+    assert r4.output["count"] == 3 and not r4.replayed
+    first = reg.call_parallel([("write_thing", {"k": "a"}, "call-3")], ctx)[0]  # the loop keys by the model's call id and the call
+    again = reg.call_parallel([("write_thing", {"k": "a"}, "call-3")], ctx)[0]
+    assert first.output["count"] == 4 and not first.replayed and again.replayed and again.output["count"] == 4
+    reused_id = reg.call_parallel([("write_thing", {"k": "b"}, "call-3")], ctx)[0]  # a server that reuses ids never replays a different call
+    assert reused_id.output["count"] == 5 and not reused_id.replayed
 
 
 def test_compaction_timeout_and_errors(workspace, ctx):

@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from ...adapters.markdown import markdown_to_html
-from ...domain.utils import read_json
+
+CHAPTER_HEAD_CHARS = 2000  # how much of a chapter is read to find its title (chars)
 
 
 class AppService:
@@ -15,12 +16,21 @@ class AppService:
         self._build_thread: threading.Thread | None = None
         self._build_state: dict[str, Any] = {"running": False}
         self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_stop = threading.Event()
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ workspace
     def workspace_info(self) -> dict[str, Any]:
         ws = self.app.workspace
-        return {"name": ws.name, "root": str(ws.root), "provider": getattr(self.app.provider, "name", "?"), "model": getattr(self.app.provider, "model", "")}
+        meta = self.app.provider_meta
+        return {
+            "name": ws.name,
+            "root": str(ws.root),
+            "provider": getattr(self.app.provider, "name", "?"),
+            "model": getattr(self.app.provider, "model", ""),
+            "provider_source": meta.get("source", ""),
+            "warnings": [w for w in [meta.get("warning"), *meta.get("warnings", [])] if w],
+        }
 
     # ------------------------------------------------------------------ sessions and chat
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -43,11 +53,10 @@ class AppService:
             if screen:
                 extra["screen"] = screen
                 if screen.get("chapter"):
-                    extra["subdir"] = str(Path(screen["chapter"]).parent)
+                    extra["subdir"] = str(Path(str(screen["chapter"])).parent)
             _, result = self.app.chat(text, session_id=session_id, extra_context=extra)
-            d = result.to_dict() if hasattr(result, "to_dict") else {"text": str(result)}
-            d.setdefault("text", getattr(result, "text", ""))
-            d.setdefault("stop_reason", getattr(result, "stop_reason", "done"))
+            d = result.to_dict()
+            d["session_id"] = session_id
             return d
 
     # ------------------------------------------------------------------ book
@@ -57,8 +66,8 @@ class AppService:
     def chapters(self) -> list[dict[str, Any]]:
         ws = self.app.workspace
         out = []
-        for rel in ws.glob("book/chapters/*.md"):
-            head = ws.read_text(rel, 0, 2000)
+        for rel in sorted(ws.glob("book/chapters/*.md")):
+            head = ws.read_text(rel, 0, CHAPTER_HEAD_CHARS)
             title = rel.rsplit("/", 1)[-1]
             for line in head.splitlines():
                 if line.startswith("title:"):
@@ -80,11 +89,11 @@ class AppService:
 
     # ------------------------------------------------------------------ sources
     def sources(self) -> list[dict[str, Any]]:
-        try:
-            from ...adapters import ingest
+        from ...adapters import ingest
 
-            return [r.to_dict() if hasattr(r, "to_dict") else r for r in ingest.list_sources(self.app.workspace)]
-        except Exception:  # noqa: BLE001
+        try:
+            return [r.to_dict() for r in ingest.list_sources(self.app.workspace)]
+        except Exception:  # noqa: BLE001 - a broken sources folder shows as empty, the doctor says why
             return []
 
     def locator(self, locator: str) -> dict[str, Any]:
@@ -94,17 +103,13 @@ class AppService:
 
     # ------------------------------------------------------------------ learner, unknowns, build, doctor
     def learner(self) -> dict[str, Any]:
-        ws = self.app.workspace
-        try:
-            from ...domain.learner import LearnerStore
+        from ...domain.learner import LearnerStore
 
-            store = LearnerStore(ws)
-            due = store.due()
-            progress = store.progress()
-        except Exception:  # noqa: BLE001
-            due, progress = [], {}
-        mastery = (read_json(ws.path("mastery"), {}) or {}).get("concepts", {})
-        return {"progress": progress, "due": [d if isinstance(d, dict) else {"concept": d} for d in due], "mastery": mastery}
+        try:
+            store = LearnerStore(self.app.workspace)
+            return {"progress": store.progress(), "due": store.due(), "mastery": store.mastery().get("concepts", {}), "misconceptions": store.open_misconceptions()}
+        except Exception as e:  # noqa: BLE001 - an unreadable learner file is reported, not fatal
+            return {"progress": {}, "due": [], "mastery": {}, "misconceptions": [], "error": f"{type(e).__name__}: {e}"}
 
     def unknowns(self) -> dict[str, Any]:
         ledger = self.app.unknowns()
@@ -124,10 +129,9 @@ class AppService:
             try:
                 if not self.app.outline().units:
                     self.app.plan_build(goal)
-                job = self.app.build_job()
-                report = job.run()
-                self._build_state = {"running": False, "goal": goal, "report": report.to_dict() if hasattr(report, "to_dict") else str(report), "error": None}
-            except Exception as e:  # noqa: BLE001
+                report = self.app.build_job().run()
+                self._build_state = {"running": False, "goal": goal, "report": report.to_dict(), "error": None}
+            except Exception as e:  # noqa: BLE001 - the failure is shown in the build tab
                 self._build_state = {"running": False, "goal": goal, "error": f"{type(e).__name__}: {e}"}
 
         self._build_thread = threading.Thread(target=run, name="edgent-build", daemon=True)
@@ -140,17 +144,20 @@ class AppService:
     def events(self, since: int = 0) -> list[dict[str, Any]]:
         return self.app.events(since)
 
-    def start_heartbeat(self) -> None:
-        from ...application.heartbeat import Heartbeat
-
-        settings = self.app.settings.get("heartbeat") or {}
-
+    # ------------------------------------------------------------------ heartbeat
+    def start_heartbeat(self) -> bool:
         def run(prompt: str) -> Any:
             with self._lock:
                 _, result = self.app.chat(prompt)
             return result.text
 
-        hb = Heartbeat(self.app.workspace, run, times=settings.get("times"), interval_minutes=settings.get("interval_minutes"), prompt=settings.get("prompt"), tz=settings.get("timezone", "UTC"))
-        stop = threading.Event()
-        self._heartbeat_thread = threading.Thread(target=hb.run_forever, args=(stop,), name="edgent-heartbeat", daemon=True)
+        hb = self.app.heartbeat(run)
+        if not hb.configured():
+            return False
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(target=hb.run_forever, args=(self._heartbeat_stop,), name="edgent-heartbeat", daemon=True)
         self._heartbeat_thread.start()
+        return True
+
+    def stop_heartbeat(self) -> None:
+        self._heartbeat_stop.set()

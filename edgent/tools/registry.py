@@ -104,6 +104,7 @@ class ToolSpec:
     version: int = 1
     group: str = "core"  # core | sources | book | media | assess | learner | checks | session | custom
     attaches_media: bool = False
+    max_inline_chars: int | None = None  # per-tool inline output ceiling (chars); None means MAX_INLINE_OUTPUT_CHARS
 
     def full_description(self) -> str:
         desc = self.description.strip()
@@ -298,7 +299,8 @@ class ToolResult:
 
 
 class IdempotencyStore:
-    """Persisted results of side-effecting tool calls, keyed by (session, key)."""
+    """Persisted results of side-effecting tool calls, keyed by (session, key). A result is replayed only when a caller
+    repeats the same explicit key (a resumed turn re-sending the model's call id); the arguments alone never form a key."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
@@ -330,6 +332,9 @@ class ToolRegistry:
         self.metrics = metrics
         self.failures: dict[str, list[dict[str, Any]]] = {}
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tool")
+        # Dispatch of parallel batches gets its own pool: a tool call occupies one worker while it runs and, when a
+        # subagent calls tools from inside it, its batch must not wait on the same workers (a nested tree would deadlock).
+        self._dispatch = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tool-dispatch")
 
     # ------------------------------------------------------------------ definition
     def register(self, spec: ToolSpec) -> ToolSpec:
@@ -436,8 +441,10 @@ class ToolRegistry:
                 how = "the user declined" if ctx.ask_permission is not None else "there is no way to ask in this session"
                 return fail(HarnessError("permission_denied", f"tool {name!r} ({spec.permission}) needs approval and {how}", ErrorCategory.permission_denied,
                                          remediation="Do not retry. Explain what you wanted to do and continue with what is allowed."))
-        key = idempotency_key or f"{name}:{json_dumps(arguments)}"
-        if spec.side_effects and self.idempotency is not None:
+        # Replay happens only for an explicit key (the loop passes the model's call id): keying on the arguments
+        # replayed a repeated write_file with identical content after the file had changed under it.
+        key = idempotency_key
+        if key is not None and spec.side_effects and self.idempotency is not None:
             cached = self.idempotency.get(ctx.session_id, key)
             if cached is not None:
                 res = ToolResult.from_dict(cached)
@@ -470,21 +477,28 @@ class ToolRegistry:
             for att in output.pop("_attach", []) or []:
                 if isinstance(att, dict) and att.get("path"):
                     attachments.append(ContentPart.of_media(att.get("type", "image"), att["path"], att.get("mime"), att.get("text", "")))
-        output, compacted = self._compact(output, ctx, name, call_id)
+        output, compacted = self._compact(output, ctx, name, call_id, spec.max_inline_chars)
         res = ToolResult(call_id, name, True, output, None, artifact_paths, attachments, time.monotonic() - t0, compacted)
-        if spec.side_effects and self.idempotency is not None:
+        if key is not None and spec.side_effects and self.idempotency is not None:
             self.idempotency.put(ctx.session_id, key, res.to_dict())
         self._trace(ctx, res, arguments)
         return res
 
     def call_parallel(self, calls: list[tuple[str, dict[str, Any], str | None]], ctx: ToolContext, allowlist: set[str] | None = None) -> list[ToolResult]:
         """Independent calls dispatched together; order of results matches order of calls."""
-        futs = [self._pool.submit(self.call, n, a, ctx, allowlist, None, cid) for n, a, cid in calls]
+        # The replay key is the model's call id together with the call itself: a resumed turn that re-sends the
+        # same call replays, while a server that reuses ids across turns (call_0, call_1, ...) never gets a stale result.
+        keyed = [(n, a, cid, f"{cid}:{n}:{json_dumps(a)}" if cid else None) for n, a, cid in calls]
+        if len(keyed) == 1:  # the common case runs on the caller's thread and costs no dispatch worker
+            n, a, cid, key = keyed[0]
+            return [self.call(n, a, ctx, allowlist, key, cid)]
+        futs = [self._dispatch.submit(self.call, n, a, ctx, allowlist, key, cid) for n, a, cid, key in keyed]
         return [f.result() for f in futs]
 
-    def _compact(self, output: Any, ctx: ToolContext, name: str, call_id: str) -> tuple[Any, bool]:
+    def _compact(self, output: Any, ctx: ToolContext, name: str, call_id: str, limit: int | None = None) -> tuple[Any, bool]:
+        limit = limit or MAX_INLINE_OUTPUT_CHARS
         text = output if isinstance(output, str) else json_dumps(output)
-        if len(text) <= MAX_INLINE_OUTPUT_CHARS:
+        if len(text) <= limit:
             return output, False
         d = ctx.tool_results_dir()
         pointer: str | None = None
@@ -496,7 +510,7 @@ class ToolRegistry:
                 pointer = ctx.workspace.relpath(p)
             except Exception:
                 pointer = str(p)
-        preview = truncate(text, MAX_INLINE_OUTPUT_CHARS)
+        preview = truncate(text, limit)
         return {
             "compacted": True,
             "preview": preview,

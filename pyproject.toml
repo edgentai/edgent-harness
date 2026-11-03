@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "edgent"
 version = "0.1.0"
 description = "Edgent: a general-purpose agent harness (Claude Code class) with a deep education layer. Standard library core; optional toolchains."
-readme = "readme.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = []

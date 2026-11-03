@@ -27,7 +27,9 @@ def run_scenario(scenario: Scenario, root: Path | None = None) -> tuple[list[Any
         ws.write_text(rel, content)
     provider = MockProvider()
     provider.push(*[scripted_reply(r) for r in scenario.scripted_replies])
-    app = App(ws, AppConfig(provider="mock", effort="low"), provider=provider)
+    home = base / "home"  # a private user directory: the runner must not see the developer's own settings or skills
+    home.mkdir(exist_ok=True)
+    app = App(ws, AppConfig(provider="mock", effort="low", home=str(home)), provider=provider)
     session = app.new_session("chat", title=scenario.id)
     loop = app.loop(session, permission_mode="auto")
     result = loop.run_turn(scenario.task)

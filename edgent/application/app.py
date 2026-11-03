@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,23 +20,33 @@ from ..domain.evidence import EvidenceStore
 from ..domain.outline import Outline
 from ..domain.types import ContentPart
 from ..domain.unknowns import UnknownsLedger
-from ..domain.workspace import Workspace
+from ..domain.workspace import Workspace, _merge_settings
 from ..observability import Metrics, Tracer
-from ..tools.registry import IdempotencyStore, ToolContext, ToolRegistry
+from ..tools.registry import AllowAll, IdempotencyStore, ToolContext, ToolRegistry
+
+EVENT_BUFFER_MAX = 500  # progress events kept for UI polling (count)
+EVENT_DETAIL_CHARS = 300  # longest event detail kept (chars)
+WORKER_STATUS = {"done": "done", "max_iterations": "partial", "budget": "partial", "cancelled": "error", "error": "error"}
+JUDGEABLE_SUFFIXES = (".md", ".markdown", ".txt")
 
 
-def _home() -> Path:
+def default_home(home: str | os.PathLike[str] | None = None) -> Path:
+    """The user directory (skills, agents, settings): an explicit path, else EDGENT_HOME, else ~/.edgent."""
+    if home is not None:
+        return Path(home)
     return Path(os.environ.get("EDGENT_HOME", Path.home() / ".edgent"))
 
 
 @dataclass
 class AppConfig:
-    provider: str | None = None  # gemini | openai | agy | claude | mock
-    model: str | None = None
+    provider: str | None = None  # gemini | openai | agy | claude | mock; None lets settings and the environment decide
+    model: str | None = None  # overrides settings.provider.model
     effort: str = "medium"
-    mode: str | None = None  # permission mode override
+    mode: str | None = None  # permission mode override: ask | accept-edits | auto | plan | bypass
     max_tokens: int = 4096
     verbose: bool = False
+    critic: bool = True  # review newly done build units with a separate-context judge
+    home: str | None = None  # user directory; None means EDGENT_HOME or ~/.edgent
     settings_overrides: dict[str, Any] = field(default_factory=dict)
 
 
@@ -44,22 +55,27 @@ class App:
 
     def __init__(self, workspace: Workspace, config: AppConfig | None = None, provider: Provider | None = None) -> None:
         from ..adapters.providers.factory import make_provider
+        from .skills import SkillIndex
+        from .subagents import AgentIndex
 
         self.workspace = workspace
         self.config = config or AppConfig()
-        self.home = _home()
+        self.home = default_home(self.config.home)
         self.settings: dict[str, Any] = workspace.settings(self.home)
         if self.config.settings_overrides:
-            self.settings.update(self.config.settings_overrides)
+            self.settings = _merge_settings(self.settings, self.config.settings_overrides)
+        if self.config.model:
+            conf = self.settings.get("provider")
+            self.settings["provider"] = {**(conf if isinstance(conf, dict) else {}), "model": self.config.model}
         self.toolchain = Toolchain.detect()
         self.metrics = Metrics()
         self.provider: Provider = provider or make_provider(self.settings, which=self.config.provider)
-        if self.config.model and hasattr(self.provider, "model"):
-            self.provider.model = self.config.model
-        self.registry = self.build_registry()
+        if not isinstance(getattr(self.provider, "meta", None), dict):
+            self.provider.meta = {"kind": getattr(self.provider, "name", "?"), "source": "argument", "warnings": []}  # type: ignore[attr-defined]
         self.evidence = EvidenceStore(workspace.path("evidence"))
-        self.skills = self._load_skills()
-        self.agents = self._load_agents()
+        self.registry = self.build_registry()
+        self.skills = SkillIndex.discover(workspace, self.home)
+        self.agents = AgentIndex.discover(workspace, self.home)
         self._events: list[dict[str, Any]] = []
         self._events_lock = threading.Lock()
         self._seq = 0
@@ -88,27 +104,19 @@ class App:
             builder(reg)
         return reg
 
-    def _load_skills(self) -> Any:
-        from .skills import SkillIndex
-
-        idx = SkillIndex()
-        idx.load(SkillIndex.default_dirs(self.workspace, self.home), ["workspace", "user", "builtin"])
-        return idx
-
-    def _load_agents(self) -> Any:
-        from .subagents import AgentIndex
-
-        idx = AgentIndex()
-        idx.load(AgentIndex.default_dirs(self.workspace, self.home), ["workspace", "user", "builtin"])
-        return idx
+    @property
+    def provider_meta(self) -> dict[str, Any]:
+        meta = getattr(self.provider, "meta", None)
+        return dict(meta) if isinstance(meta, dict) else {}
 
     # ------------------------------------------------------------------ pieces
     def permissions(self, mode: str | None = None) -> Any:
         from .permissions import Permissions
 
         settings = dict(self.settings)
-        if mode or self.config.mode:
-            settings["mode"] = mode or self.config.mode
+        chosen = mode or self.config.mode
+        if chosen:
+            settings["mode"] = chosen
         return Permissions.from_settings(settings, self.workspace)
 
     def hooks(self, tracer: Any = None) -> Any:
@@ -119,10 +127,7 @@ class App:
     def budget(self) -> Any:
         from .budgets import Budget, BudgetTracker
 
-        b = Budget.from_env()
-        if "budget" in self.settings:
-            b = Budget.from_settings(self.settings)
-        return BudgetTracker(b)
+        return BudgetTracker(Budget.from_settings(self.settings, base=Budget.from_env()))
 
     def system_prompt(self, role: str = "main", mode: str = "chat", extra: str = "") -> str:
         from .. import prompts
@@ -130,18 +135,38 @@ class App:
         return prompts.build_system_prompt(role, mode=mode, caps=self.provider.caps, extra=extra)
 
     def tracer(self, session_id: str) -> Tracer:
-        return Tracer(self.workspace.path("traces"), session_id, echo=self._on_trace)
+        return Tracer(self.workspace.path("traces"), session_id)
 
-    def _on_trace(self, ev: Any) -> None:
+    # ------------------------------------------------------------------ progress events (for UIs polling a process)
+    def emit(self, event: dict[str, Any]) -> None:
+        kind = event.get("type") or event.get("event") or event.get("kind") or "event"
+        detail = event.get("preview") or event.get("text") or event.get("reason") or event.get("status") or event.get("error") or ""
+        row = {
+            "seq": 0,
+            "ts": time.time(),
+            "kind": str(kind),
+            "session_id": event.get("session_id"),
+            "name": event.get("name") or event.get("unit_id") or event.get("agent") or "",
+            "ok": event.get("ok"),
+            "detail": str(detail)[:EVENT_DETAIL_CHARS],
+        }
         with self._events_lock:
             self._seq += 1
-            d = {"seq": self._seq, "kind": ev.kind, "session_id": ev.session_id, "name": ev.data.get("name"), "detail": (ev.data.get("output_preview") or ev.data.get("finish_reason") or "")[:200]}
-            self._events.append(d)
-            del self._events[:-500]
+            row["seq"] = self._seq
+            self._events.append(row)
+            del self._events[:-EVENT_BUFFER_MAX]
 
     def events(self, since: int = 0) -> list[dict[str, Any]]:
         with self._events_lock:
-            return [e for e in self._events if e["seq"] > since]
+            return [dict(e) for e in self._events if e["seq"] > since]
+
+    def _chain(self, on_event: Callable[[dict[str, Any]], None] | None) -> Callable[[dict[str, Any]], None]:
+        def fn(event: dict[str, Any]) -> None:
+            self.emit(event)
+            if on_event is not None:
+                on_event(event)
+
+        return fn
 
     # ------------------------------------------------------------------ loops
     def loop(
@@ -184,7 +209,7 @@ class App:
             ask_user=ask_user,
             ask_permission=ask_permission,
             role=role,
-            on_event=on_event,
+            on_event=self._chain(on_event),
             evidence_store=self.evidence,
             toolchain=self.toolchain,
             settings=self.settings,
@@ -214,26 +239,42 @@ class App:
         result = loop.run_turn(text, parts=parts, extra_context=extra)
         return session, result
 
-    # ------------------------------------------------------------------ tool context (MCP host mode, scripts)
-    def tool_context(self, session: Any = None, role: str = "host", permissions: Any = None) -> ToolContext:
+    # ------------------------------------------------------------------ tool context (MCP host mode, CLI commands, the build gate)
+    def tool_context(
+        self,
+        session: Any = None,
+        role: str = "host",
+        permissions: Any = None,
+        ask_permission: Callable[[Any, dict[str, Any]], bool] | None = None,
+        ask_user: Callable[[str], str] | None = None,
+        node_id: str = "",
+    ) -> ToolContext:
+        session_id = session.session_id if session is not None else role
         return ToolContext(
             workspace=self.workspace,
-            session_id=session.session_id if session is not None else "host",
+            session_id=session_id,
+            node_id=node_id,
             role=role,
             provider=self.provider,
             evidence=self.evidence,
             settings=self.settings,
             toolchain=self.toolchain,
-            permissions=permissions or self.permissions(),
-            tracer=None,
+            permissions=permissions if permissions is not None else self.permissions(),
+            ask_user=ask_user,
+            ask_permission=ask_permission,
+            tracer=self.tracer(session_id),
             metrics=self.metrics,
             session=session,
             skills=self.skills,
+            extra={"registry": self.registry},
         )
 
     # ------------------------------------------------------------------ build
-    def build_job(self, on_event: Callable[[dict[str, Any]], None] | None = None, max_parallel: int = 1) -> Any:
+    def build_job(self, on_event: Callable[[dict[str, Any]], None] | None = None, max_parallel: int = 1, max_rounds: int = 2, critic: bool | None = None) -> Any:
+        from ..tools.edu.book import mark_unit_done
         from .jobs.build import BuildJob, UnitOutcome
+
+        events = self._chain(on_event)
 
         def run_unit(unit: Any, brief: str) -> UnitOutcome:
             session = self.new_session("build", title=f"unit {unit.id}")
@@ -241,34 +282,65 @@ class App:
             session.save()
             loop = self.loop(session, role="worker", mode="build", on_event=on_event, permission_mode="auto")
             result = loop.run_turn(brief)
-            status = "done" if result.stop_reason == "done" else "error"
-            return UnitOutcome(unit_id=unit.id, status=status, ledger=[], text=result.text, usage=result.usage, error=None if status == "done" else result.stop_reason)
+            status = WORKER_STATUS.get(result.stop_reason, "error")
+            error = None
+            if status != "done":
+                error = f"worker stopped: {result.stop_reason}" + ("; " + "; ".join(result.errors[-3:]) if result.errors else "")
+            return UnitOutcome(unit_id=unit.id, status=status, text=result.text, usage=result.usage, error=error)
 
-        return BuildJob(self.workspace, run_unit=run_unit, on_event=on_event, max_parallel=max_parallel)
+        def mark_done(unit: Any) -> dict[str, Any]:
+            return mark_unit_done(self.tool_context(role="build", permissions=AllowAll(), node_id=unit.id), unit.id)
+
+        def judge(unit: Any) -> list[dict[str, Any]]:
+            if not unit.path or not str(unit.path).endswith(JUDGEABLE_SUFFIXES):
+                return []
+            ctx = self.tool_context(role="critic", permissions=AllowAll(), node_id=unit.id)
+            res = self.registry.call("check_judge", {"path": unit.path, "unit_id": unit.id}, ctx)
+            if not res.ok:
+                raise RuntimeError(res.error.message if res.error else "check_judge failed")
+            output = res.output if isinstance(res.output, dict) else {}
+            return [d for d in output.get("defects") or [] if isinstance(d, dict)]
+
+        use_critic = self.config.critic if critic is None else critic
+        return BuildJob(
+            self.workspace,
+            run_unit=run_unit,
+            mark_done=mark_done,
+            critic=judge if use_critic else None,
+            max_rounds=max_rounds,
+            max_parallel=max_parallel,
+            on_event=events,
+            tracer=self.tracer("build"),
+        )
 
     def plan_build(self, goal: str, on_event: Callable[[dict[str, Any]], None] | None = None) -> Any:
-        """Initializer session: propose the outline for a goal through the model."""
+        """Initializer session: the model proposes the outline for a goal; the job validates and saves it."""
         from ..domain.utils import extract_json
-        from .jobs.briefs import initializer_brief
 
         job = self.build_job(on_event=on_event)
 
-        def propose(brief: str) -> list[dict[str, Any]]:
+        def propose(brief: str) -> list[dict[str, Any]] | dict[str, Any]:
             session = self.new_session("build", title="initializer")
             loop = self.loop(session, role="initializer", mode="build", on_event=on_event, permission_mode="auto")
             result = loop.run_turn(brief)
             data = extract_json(result.text)
-            if isinstance(data, dict):
-                data = data.get("units", [])
-            if not isinstance(data, list):
-                outline = Outline(self.workspace.path("outline"))
-                if outline.units:  # the model may have used book_outline_propose directly
-                    return []
-                raise RuntimeError("the initializer did not return a unit list; see the session transcript")
-            return data
+            if isinstance(data, dict) and isinstance(data.get("units"), list):
+                return data
+            if isinstance(data, list):
+                return data
+            return {"units": []}  # the initializer may have used book_outline_propose itself; the job checks the outline
 
-        index = self.workspace.read_text("sources/INDEX.md") if self.workspace.file_exists("sources/INDEX.md") else ""
-        return job.plan(goal, lambda _brief: propose(initializer_brief(goal, self.workspace, index)))
+        return job.plan(goal, propose)
+
+    # ------------------------------------------------------------------ heartbeat
+    def heartbeat(self, run: Callable[[str], Any] | None = None, on_event: Callable[[dict[str, Any]], None] | None = None) -> Any:
+        from .heartbeat import Heartbeat
+
+        def default_run(prompt: str) -> Any:
+            _, result = self.chat(prompt, on_event=on_event)
+            return result.text
+
+        return Heartbeat.from_settings(self.workspace, run or default_run, self.settings, tracer=self.tracer("heartbeat"))
 
     # ------------------------------------------------------------------ reads for UIs
     def outline(self) -> Outline:
@@ -291,8 +363,15 @@ class App:
             health = self.provider.health()
         except Exception as e:  # noqa: BLE001
             health = {"ok": False, "error": str(e)}
-        report["provider"] = {"name": getattr(self.provider, "name", "?"), "model": getattr(self.provider, "model", ""), "health": health, "caps": self.provider.caps.__dict__}
+        report["provider"] = {
+            "name": getattr(self.provider, "name", "?"),
+            "model": getattr(self.provider, "model", ""),
+            "health": health,
+            "caps": dict(self.provider.caps.__dict__),
+            **{k: v for k, v in self.provider_meta.items() if k in ("kind", "source", "warnings", "warning", "hint")},
+        }
         report["workspace"] = {"root": str(self.workspace.root), "git": self.workspace.is_git_repo(), "settings": {k: v for k, v in self.settings.items() if k != "provider"}}
-        report["skills"] = self.skills.names() if hasattr(self.skills, "names") else []
-        report["agents"] = self.agents.names() if hasattr(self.agents, "names") else []
+        report["skills"] = self.skills.names()
+        report["agents"] = self.agents.names()
+        report["tools"] = len(self.registry.names())
         return report

@@ -23,6 +23,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     h.mkdir()
     monkeypatch.setenv("EDGENT_HOME", str(h))
     monkeypatch.setenv("HOME", str(h))
+    monkeypatch.setenv("EDGENT_PROVIDER", "mock")  # never let a test reach a real key or an installed agy/claude CLI
     return h
 
 
