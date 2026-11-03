@@ -1,0 +1,39 @@
+[
+  {
+    "id": "build-unit-checks-before-done",
+    "title": "A worker runs the checks and marks the unit done through the tool",
+    "tags": ["build", "done-gate"],
+    "task": "Finish unit chapter-vectors: make sure its code runs and then mark it done.",
+    "setup_files": {
+      "book/outline.json": "{\"version\": 1, \"title\": \"Linear Algebra\", \"persona\": \"undergraduate\", \"meta\": {}, \"units\": [{\"id\": \"chapter-vectors\", \"kind\": \"chapter\", \"title\": \"Vectors\", \"objective\": \"what a vector is\", \"status\": \"in_progress\", \"depends_on\": [], \"path\": \"book/chapters/01-vectors.md\", \"checks\": [], \"attempts\": 1, \"open_obligations\": [], \"history\": [], \"meta\": {\"level\": \"undergraduate\"}}]}",
+      "book/chapters/01-vectors.md": "---\ntitle: Vectors\nunit_id: chapter-vectors\nlevel: undergraduate\nintroduces: [vector]\n---\n# Vectors\n\nA vector is a list of numbers. Here is one in code.\n\n```python\nv = [1, 2, 3]\nprint(sum(v))\n```\n\n```output\n6\n```\n\nThe sum of its entries is six. You can now add vectors.\n"
+    },
+    "scripted_replies": [
+      {"tool_calls": [{"name": "read_file", "arguments": {"path": "book/chapters/01-vectors.md"}}]},
+      {"tool_calls": [{"name": "check_execute", "arguments": {"path": "book/chapters/01-vectors.md"}}]},
+      {"tool_calls": [{"name": "book_mark_done", "arguments": {"unit_id": "chapter-vectors"}}]},
+      {"text": "The chapter's code block runs and prints 6 as expected. Unit chapter-vectors is marked done; the readability and judge checks are advisory and recorded."}
+    ],
+    "expected_first_tool": "read_file",
+    "required_subsequence": ["read_file", "check_execute", "book_mark_done"],
+    "forbidden_tools": ["bash"],
+    "claims": [{"id": "code-executed", "expected": "controlled_replay", "evidence_operation": "check_execute", "required_authority": "controlled_replay", "required_confidence": "derived", "select": "authority"}]
+  },
+  {
+    "id": "assess-keys-verified",
+    "title": "An assessment set is created and its keys are verified mechanically",
+    "tags": ["assess"],
+    "task": "Create a 2-item numeric quiz set 'q1' on adding vectors and verify the answer keys.",
+    "setup_files": {},
+    "scripted_replies": [
+      {"tool_calls": [{"name": "assess_create", "arguments": {"set_id": "q1", "objectives": ["add two vectors"], "n_items": 2, "kinds": ["numeric"], "level": "undergraduate"}}]},
+      {"text": "{\"set_id\": \"q1\", \"title\": \"Adding vectors\", \"objectives\": [\"add two vectors\"], \"level\": \"undergraduate\", \"items\": [{\"id\": \"i1\", \"kind\": \"numeric\", \"stem\": \"What is the first entry of (1,2)+(3,4)?\", \"answer\": 4, \"tolerance\": 0, \"solution\": \"1+3\", \"concept\": \"vector addition\", \"difficulty\": 1, \"verify\": {\"type\": \"numeric\", \"expression\": \"1+3\"}}, {\"id\": \"i2\", \"kind\": \"numeric\", \"stem\": \"What is the second entry of (1,2)+(3,4)?\", \"answer\": 6, \"tolerance\": 0, \"solution\": \"2+4\", \"concept\": \"vector addition\", \"difficulty\": 1, \"verify\": {\"type\": \"numeric\", \"expression\": \"2+4\"}}]}"},
+      {"tool_calls": [{"name": "assess_items_check", "arguments": {"set_id": "q1"}}]},
+      {"text": "Set q1 has two numeric items; both keys were recomputed in the sandbox and match (4 and 6)."}
+    ],
+    "expected_first_tool": "assess_create",
+    "required_subsequence": ["assess_create", "assess_items_check"],
+    "answer_must_contain": ["q1"],
+    "claims": [{"id": "keys-verified", "expected": "controlled_replay", "evidence_operation": "assessment_key_check", "required_authority": "controlled_replay", "required_confidence": "derived", "select": "authority"}]
+  }
+]

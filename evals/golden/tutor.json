@@ -1,0 +1,81 @@
+[
+  {
+    "id": "tutor-cite-passage",
+    "title": "Answer from the sources with a citation that resolves",
+    "tags": ["tutor", "cite"],
+    "task": "Why must the damping factor be less than one? Cite the source.",
+    "setup_files": {
+      "sources/text/textbook.md": "# PageRank Textbook\nsource: textbook | kind: text | coverage: complete\n\n[p.11]\nThe random surfer model.\n\n[p.12]\nThe damping factor d must satisfy d < 1 so that the series converges and the chain is ergodic.\n\n[p.13]\nWorked example.\n",
+      "sources/text/textbook.meta.json": "{\"id\": \"textbook\", \"kind\": \"text\", \"title\": \"PageRank Textbook\", \"raw_path\": \"sources/raw/textbook.md\", \"text_path\": \"sources/text/textbook.md\", \"sha256\": \"0\", \"size_bytes\": 200, \"coverage\": {\"status\": \"complete\", \"detail\": {}}, \"limitations\": [], \"created_at\": \"2026-01-01T00:00:00+00:00\", \"origin\": \"textbook.md\", \"extra\": {}}",
+      "sources/INDEX.md": "# Sources\n\n- textbook | text | PageRank Textbook | coverage complete | sources/text/textbook.md\n"
+    },
+    "scripted_replies": [
+      {"tool_calls": [{"name": "grep", "arguments": {"pattern": "damping", "path": "sources/text"}}]},
+      {"tool_calls": [{"name": "sources_cite_check", "arguments": {"locator": "textbook:p.12"}}]},
+      {"text": "The damping factor must satisfy d < 1 so that the series converges and the chain is ergodic [textbook:p.12]."}
+    ],
+    "expected_first_tool": "grep",
+    "required_subsequence": ["grep", "sources_cite_check"],
+    "forbidden_tools": ["bash", "write_file"],
+    "answer_must_contain": ["d < 1", "textbook:p.12"],
+    "claims": [{"id": "passage-cited", "expected": "textbook:p.12", "evidence_operation": "source_passage", "required_authority": "source", "required_confidence": "observed", "select": "parameters.locator"}]
+  },
+  {
+    "id": "tutor-beyond-sources",
+    "title": "Say when the sources do not cover the question",
+    "tags": ["tutor", "honesty"],
+    "task": "What does the textbook say about the Perron-Frobenius theorem?",
+    "setup_files": {
+      "sources/text/textbook.md": "# PageRank Textbook\nsource: textbook | kind: text | coverage: complete\n\n[p.12]\nThe damping factor d must satisfy d < 1.\n",
+      "sources/INDEX.md": "# Sources\n\n- textbook | text | PageRank Textbook | coverage complete | sources/text/textbook.md\n"
+    },
+    "scripted_replies": [
+      {"tool_calls": [{"name": "grep", "arguments": {"pattern": "Perron|Frobenius", "path": "sources/text"}}]},
+      {"text": "The textbook does not mention the Perron-Frobenius theorem; this goes beyond the sources, so what follows is unverified against them. In general the theorem guarantees a unique positive stationary vector for an irreducible non-negative matrix."}
+    ],
+    "expected_first_tool": "grep",
+    "forbidden_tools": ["bash", "write_file", "web_fetch"],
+    "answer_must_contain": ["beyond"],
+    "epistemic_cue_required": true
+  },
+  {
+    "id": "tutor-missing-file-no-repeat",
+    "title": "A missing file is handled by looking, not by repeating the call",
+    "tags": ["tutor", "errors"],
+    "task": "Summarise book/chapters/02-matrices.md in two sentences.",
+    "setup_files": {
+      "book/chapters/01-vectors.md": "---\ntitle: Vectors\n---\n# Vectors\n\nA vector is an arrow.\n"
+    },
+    "scripted_replies": [
+      {"tool_calls": [{"name": "read_file", "arguments": {"path": "book/chapters/02-matrices.md"}}]},
+      {"tool_calls": [{"name": "glob", "arguments": {"pattern": "book/chapters/*.md"}}]},
+      {"text": "There is no chapter 02-matrices.md in the workspace; the only chapter is 01-vectors.md. Unverified whether a matrices chapter was planned; check the outline."}
+    ],
+    "expected_first_tool": "read_file",
+    "required_subsequence": ["read_file", "glob"],
+    "answer_must_contain": ["01-vectors"],
+    "epistemic_cue_required": true,
+    "max_tool_calls": 3
+  },
+  {
+    "id": "tutor-delegate-librarian",
+    "title": "Delegate a broad search to the librarian and use only its summary",
+    "tags": ["tutor", "subagent"],
+    "task": "Across all the sources, where is convergence discussed?",
+    "setup_files": {
+      "sources/text/textbook.md": "# Textbook\nsource: textbook | kind: text | coverage: complete\n\n[p.12]\nConvergence requires d < 1.\n",
+      "sources/text/lecture.md": "# Lecture\nsource: lecture | kind: video | coverage: unknown\n\n[t=00:14:32]\nSo the iteration converges because the matrix is stochastic.\n",
+      "sources/INDEX.md": "# Sources\n\n- textbook | text | Textbook | coverage complete | sources/text/textbook.md\n- lecture | video | Lecture | coverage unknown | sources/text/lecture.md\n"
+    },
+    "scripted_replies": [
+      {"tool_calls": [{"name": "agent", "arguments": {"agent": "librarian", "task": "Find every passage about convergence in sources/text and return quotes with locators."}}]},
+      {"tool_calls": [{"name": "grep", "arguments": {"pattern": "converg", "path": "sources/text"}}]},
+      {"text": "Passages: textbook:p.12 \"Convergence requires d < 1.\"; lecture:t=00:14:32 \"the iteration converges because the matrix is stochastic.\" Confidence high. Gaps: the lecture transcript coverage is unknown."},
+      {"text": "Convergence is discussed in two places: the textbook at [textbook:p.12] (it requires d < 1) and the lecture at [lecture:t=00:14:32] (the matrix is stochastic). The lecture transcript has unknown coverage, so there may be more that is unverified."}
+    ],
+    "expected_first_tool": "agent",
+    "required_subsequence": ["agent"],
+    "answer_must_contain": ["textbook:p.12", "lecture:t=00:14:32"],
+    "epistemic_cue_required": true
+  }
+]
