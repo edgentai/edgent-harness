@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edgent</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="top">
+  <div id="brand">Edgent <span id="ws-name"></span></div>
+  <nav id="tabs">
+    <button data-tab="study" class="active">Study</button>
+    <button data-tab="outline">Outline</button>
+    <button data-tab="build">Build</button>
+    <button data-tab="learner">Learner</button>
+    <button data-tab="unknowns">Unknowns</button>
+    <button data-tab="sources">Sources</button>
+    <button data-tab="doctor">Doctor</button>
+  </nav>
+</header>
+<main id="layout">
+  <aside id="side">
+    <section id="side-chapters"><h3>Chapters</h3><ul id="chapter-list"></ul></section>
+    <section id="side-sessions"><h3>Sessions <button id="new-session" title="New conversation">+</button></h3><ul id="session-list"></ul></section>
+  </aside>
+  <section id="reader">
+    <div id="tab-study" class="tab active"><article id="chapter" class="chapter"><p class="muted">Pick a chapter on the left, or just ask the tutor.</p></article></div>
+    <div id="tab-outline" class="tab"></div>
+    <div id="tab-build" class="tab">
+      <form id="build-form"><label>Goal<br><textarea id="build-goal" rows="3" placeholder="a 120-page introduction to linear algebra for a reader who knows high-school algebra, with films where motion is the idea"></textarea></label><button type="submit">Start build</button></form>
+      <pre id="build-status" class="box"></pre>
+    </div>
+    <div id="tab-learner" class="tab"></div>
+    <div id="tab-unknowns" class="tab"></div>
+    <div id="tab-sources" class="tab"></div>
+    <div id="tab-doctor" class="tab"></div>
+    <div id="locator-panel" class="hidden"><button id="locator-close">×</button><h4 id="locator-title"></h4><pre id="locator-text"></pre></div>
+  </section>
+  <section id="chat">
+    <div id="messages"></div>
+    <div id="screen-hint" class="muted"></div>
+    <form id="chat-form"><textarea id="chat-input" rows="3" placeholder="Ask about what you are reading. Shift+Enter for a new line."></textarea><button type="submit" id="send">Send</button></form>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
