@@ -3,19 +3,46 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "edgent-harness"
+name = "edgent"
 version = "0.1.0"
-description = "General-purpose multimodal agent harness (standard library only) for a self-hosted OpenAI-compatible model server"
+description = "Edgent: a general-purpose agent harness (Claude Code class) with a deep education layer. Standard library core; optional toolchains."
 readme = "readme.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = []
 
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.24"]
+browser = ["playwright>=1.45"]
+media = ["manim>=0.18"]
+stt = ["faster-whisper>=1.0"]
+dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
+
 [project.scripts]
-harness = "harness.__main__:main"
+edgent = "edgent.ui.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["harness*"]
+include = ["edgent*"]
 
 [tool.setuptools.package-data]
-"harness.prompts" = ["*.md"]
+"edgent.prompts" = ["*.md"]
+"edgent.skills" = ["**/*.md", "**/*.py", "**/*.js", "**/*.css"]
+"edgent.agents" = ["*.md"]
+"edgent.ui.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+ignore_missing_imports = true
