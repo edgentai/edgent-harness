@@ -117,7 +117,8 @@ map, a flag); never meaning by hue alone.
    show the idea; is the emphasis where the narration points; is anything cluttered or ambiguous. Fix and
    repeat.
 6. When the defect list is empty and the frames read well: `film_render` with `quality: "final"` (1080p), one
-   more look, done. `video_assemble` adds narration audio and captions when the pipeline has them; without a
+   more look, done. (`"medium"`, 720p, exists for a mid-way look at type and spacing; it is not a
+   deliverable.) `video_assemble` adds narration audio and captions when the pipeline has them; without a
    synthesiser the captions still come from the storyboard.
 
 Without manim, `film_render` returns `unavailable` with the install hint: stop at the compiled storyboard, say

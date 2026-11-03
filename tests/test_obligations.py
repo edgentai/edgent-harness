@@ -154,9 +154,9 @@ def test_readability_level_falls_back_to_outline_persona(workspace) -> None:
 @pytest.mark.parametrize(
     ("kind", "expected"),
     [
-        ("film", [("render", "film_render"), ("measure", "check_measure"), ("look", "film_look"), ("judge", "check_judge")]),
-        ("widget", [("render", "widget_run"), ("measure", "check_measure"), ("judge", "check_judge")]),
-        ("figure", [("render", "diagram_render"), ("measure", "check_measure")]),
+        ("film", [("render", "film_render"), ("measure", "film_render"), ("look", "film_look"), ("judge", "check_judge")]),
+        ("widget", [("render", "widget_run"), ("measure", "widget_run"), ("judge", "check_judge")]),
+        ("figure", [("render", "diagram_render"), ("measure", "diagram_render")]),
         ("exercise_set", [("keys", "assess_items_check"), ("judge", "check_judge")]),
         ("assessment", [("keys", "assess_items_check"), ("judge", "check_judge")]),
         ("integration", [("structure", "book_build"), ("render", "book_build")]),
@@ -180,7 +180,8 @@ def test_default_targets_follow_the_workspace_layout() -> None:
 
 def test_research_owes_a_citation_per_locator_and_an_advisory_judge() -> None:
     obs = derive_obligations(_unit("research", "r1", path="knowledge/brief.md"), "Claim [a:p.1] and [b:L3].\n")
-    assert [(o.kind, o.args.get("locator")) for o in obs] == [("cite", "a:p.1"), ("cite", "b:L3"), ("judge", None)]
+    assert [(o.kind, o.args.get("locator")) for o in obs] == [("structure", None), ("cite", "a:p.1"), ("cite", "b:L3"), ("judge", None)]
+    assert obs[0].closer == "check_cite" and not obs[0].advisory
 
 
 def test_extra_checks_add_obligations_without_duplicating_closers() -> None:
@@ -234,3 +235,16 @@ def test_inline_code_spans_carry_no_citations_or_placeholders() -> None:
     text = "Write citations as `[src:p.1]` and films as `{{film: demo}}`; a real one: [src:p.2].\n"
     assert [c["locator"] for c in citations(text)] == ["src:p.2"]
     assert placeholders(text) == []
+
+
+def test_fenced_code_inside_a_list_item_is_dedented() -> None:
+    text = "- a step\n\n    ```python\n    for i in range(2):\n        print(i)\n    ```\n\n    ```output\n    0\n    1\n    ```\n"
+    code, out = code_blocks(text)
+    assert code.language == "python" and code.code == "for i in range(2):\n    print(i)\n" and code.closed
+    assert code.expected_output == "0\n1\n" and out.language == "output"
+    assert strip_code(text).splitlines()[0] == "- a step"  # line numbers are untouched
+
+
+def test_capitalised_source_ids_cite_the_lowercase_source() -> None:
+    found = citations("See [Textbook:p.12] and [textbook:p.12] and [NOTES:L3].\n")
+    assert [(c["locator"], c["count"]) for c in found] == [("textbook:p.12", 2), ("notes:L3", 1)]

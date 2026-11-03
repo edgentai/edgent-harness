@@ -120,6 +120,7 @@ def structural_defects(ctx: ToolContext, abs_path: Path, rel: str, text: str) ->
         "display_math_delimiters": display,
         "links_checked": links_checked,
         "placeholders": refs,
+        "untrusted": True,  # keys, ids and pandoc warnings quote the file
     }
     return defects, detail
 

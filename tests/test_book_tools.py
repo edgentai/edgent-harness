@@ -208,6 +208,15 @@ def test_mark_done_missing_file_unknown_unit_and_bad_path(tools: ToolRegistry, c
     out = ok(tools, ctx, "book_mark_done", unit_id="chapter-vectors")
     assert out["status"] == "partial" and all("does not exist" in o["reason"] for o in out["open_obligations"])
     assert out["results"]["file"]["error"]["code"] == "not_found"
+    ok(tools, ctx, "book_outline_propose", units=[{"id": "no-path", "kind": "chapter", "title": "No path"}, {"id": "brief", "kind": "research", "title": "Brief", "path": "knowledge/brief.md"}])
+    out = ok(tools, ctx, "book_mark_done", unit_id="no-path")
+    assert out["status"] == "partial" and all("has no path; set one with book_outline_update" in o["reason"] for o in out["open_obligations"])
+    assert out["results"] == {"file": {"error": {"code": "invalid_input", "message": "unit no-path has no path"}}}
+    out = ok(tools, ctx, "book_mark_done", unit_id="brief")  # a research brief whose file is missing is not done
+    assert out["status"] == "partial" and [o["kind"] for o in out["open_obligations"]] == ["structure"] and "does not exist" in out["open_obligations"][0]["reason"]
+    workspace.write_text("knowledge/brief.md", "# Brief\n\nThe textbook defines displacement [textbook:p.12].\n")
+    out = ok(tools, ctx, "book_mark_done", unit_id="brief")
+    assert out["status"] == "done" and {r["kind"]: r["status"] for r in out["ledger"]} == {"structure": "closed", "cite": "closed", "judge": "open"}
     assert err(tools, ctx, "book_mark_done", unit_id="ghost").category.value == "not_found"
     o = Outline(workspace.path("outline"))
     o.get("chapter-vectors").path = "../../outside.md"
@@ -221,7 +230,7 @@ def test_mark_done_media_unit_without_closers_stays_partial_with_probes(tools: T
     assert out["status"] == "partial" and [o["kind"] for o in out["open_obligations"]] == ["render", "measure", "look"]
     assert all("is not available in this registry" in o["reason"] for o in out["open_obligations"])
     ledger = UnknownsLedger(workspace.path("unknowns"))
-    assert {u.recommended_probes[0]["operation"] for u in ledger.open(scope="film-intro")} == {"film_render", "check_measure", "film_look"}
+    assert {u.recommended_probes[0]["operation"] for u in ledger.open(scope="film-intro")} == {"film_render", "film_look"}
 
 
 def test_mark_done_reaches_external_closers_through_the_registry(tools: ToolRegistry, ctx: ToolContext, workspace) -> None:
@@ -235,14 +244,58 @@ def test_mark_done_reaches_external_closers_through_the_registry(tools: ToolRegi
 
         return fn
 
-    for name in ("film_render", "check_measure", "film_look"):
+    for name in ("film_render", "film_look"):
         tools.register(ToolSpec(name=name, description="fake", parameters=obj({"path": {"type": "string"}, "film_id": {"type": "string"}}), fn=closer(name), permission="compute"))
     ctx.extra["registry"] = tools
     out = ok(tools, ctx, "book_mark_done", unit_id="film-intro")
-    assert out["status"] == "done" and [n for n, _ in seen] == ["film_render", "check_measure", "film_look"]
+    assert out["status"] == "done" and [n for n, _ in seen] == ["film_render", "film_look"]  # one render call closes render and measure
     assert seen[0][1] == {"path": "media/films/film-intro", "film_id": "film-intro"}
     rows = {r["id"]: r for r in out["ledger"]}
-    assert rows["film-intro:render"]["evidence_ids"] == ["ev_film_render"]
+    assert rows["film-intro:render"]["evidence_ids"] == ["ev_film_render"] and rows["film-intro:measure"]["evidence_ids"] == ["ev_film_render"]
+
+
+def test_mark_done_closes_a_widget_from_its_measurement_sidecar(tools: ToolRegistry, ctx: ToolContext, workspace) -> None:
+    """widget_run takes the HTML itself, so the gate cannot re-run it; it trusts the tool's sidecar while the file is unchanged."""
+    import os
+    import time
+
+    ok(tools, ctx, "book_outline_propose", units=[{"id": "widget-slider", "kind": "widget", "title": "Slider"}])
+    tools.register(ToolSpec(name="widget_run", description="fake", parameters=obj({"widget_id": {"type": "string"}, "html": {"type": "string"}}, ["widget_id", "html"]), fn=lambda c, a: {"ok": True}, permission="compute"))
+    ctx.extra["registry"] = tools
+    out = ok(tools, ctx, "book_mark_done", unit_id="widget-slider")
+    assert out["status"] == "partial" and all("media/widgets/widget-slider.html does not exist yet" in o["reason"] for o in out["open_obligations"])
+    workspace.write_text("media/widgets/widget-slider.html", "<html><body>slider</body></html>")
+    out = ok(tools, ctx, "book_mark_done", unit_id="widget-slider")
+    assert out["status"] == "partial" and "no measurement record" in out["open_obligations"][0]["reason"]
+    workspace.write_json("media/widgets/widget-slider.html.defects.json", {"ok": False, "defects": [{"kind": "console_error", "severity": "error", "detail": "ReferenceError: x"}]})
+    out = ok(tools, ctx, "book_mark_done", unit_id="widget-slider")
+    assert out["status"] == "partial" and out["open_obligations"][0]["reason"] == "ReferenceError: x"
+    workspace.write_json("media/widgets/widget-slider.html.defects.json", {"ok": True, "defects": []})
+    out = ok(tools, ctx, "book_mark_done", unit_id="widget-slider")
+    rows = {r["id"]: r for r in out["ledger"]}
+    assert out["status"] == "done" and rows["widget-slider:render"]["status"] == rows["widget-slider:measure"]["status"] == "closed"
+    assert out["results"]["widget_run media/widgets/widget-slider.html"]["via"] == "measurement sidecar"
+    # an edit after the measurement invalidates it
+    time.sleep(0.01)
+    html = workspace.root / "media/widgets/widget-slider.html"
+    html.write_text("<html><body>changed</body></html>", encoding="utf-8")
+    side = workspace.root / "media/widgets/widget-slider.html.defects.json"
+    os.utime(side, (html.stat().st_atime, html.stat().st_mtime - 10))
+    out = ok(tools, ctx, "book_mark_done", unit_id="widget-slider")
+    assert out["status"] == "partial" and "changed after it was last measured" in out["open_obligations"][0]["reason"]
+
+
+@skip_unless("pandoc")
+def test_integration_unit_builds_the_book_and_reports_unresolved_references(tools: ToolRegistry, ctx: ToolContext, workspace) -> None:
+    propose(tools, ctx)
+    workspace.write_text("book/chapters/01-vectors.md", GOOD_CHAPTER.replace("## A worked example", "{{film: film-intro}}\n\n## A worked example"))
+    ok(tools, ctx, "book_mark_done", unit_id="chapter-vectors")
+    ok(tools, ctx, "book_outline_update", unit_id="integration", fields={"depends_on": ["chapter-vectors"]})
+    out = ok(tools, ctx, "book_mark_done", unit_id="integration")
+    rows = {r["id"]: r for r in out["ledger"]}
+    assert out["status"] == "partial" and rows["integration:render"]["status"] == "closed" and "built book/build/book.html" in rows["integration:render"]["reason"]
+    assert rows["integration:structure"]["status"] == "open" and rows["integration:structure"]["reason"] == "unresolved references: film-intro"
+    assert (workspace.root / "book/build/book.html").exists() and ctx.evidence.get(rows["integration:render"]["evidence_ids"][0]).operation == "book_build"
 
 
 def test_mark_done_with_judge_runs_the_critic_and_refuses_weak_closers(tools: ToolRegistry, ctx: ToolContext, workspace, provider: MockProvider) -> None:

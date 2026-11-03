@@ -372,11 +372,18 @@ def mark_unit_done(ctx: ToolContext, unit_id: str, *, judge: bool = False) -> di
             if unit.kind in CONTENT_UNIT_KINDS and p.is_file():  # a film or widget target is not text; its closers read it themselves
                 content = p.read_text(encoding="utf-8", errors="replace")
         obligations = derive_obligations(unit, content, outline)
-        if unit.path and content is None and unit.kind in TEXT_UNIT_KINDS:
+        results: dict[str, Any]
+        if unit.kind in CONTENT_UNIT_KINDS and not unit.path:
+            hint = "book/chapters/NN-slug.md" if unit.kind in TEXT_UNIT_KINDS else "knowledge/<slug>.md"
+            for ob in obligations:
+                if ob.status == "open":
+                    ob.reason = f"unit {unit.id} has no path; set one with book_outline_update (e.g. {hint}), write the file, then mark it again"
+            results = {"file": {"error": {"code": "invalid_input", "message": f"unit {unit.id} has no path"}}}
+        elif unit.path and content is None and unit.kind in CONTENT_UNIT_KINDS:
             for ob in obligations:
                 if ob.status == "open":
                     ob.reason = f"file {unit.path} does not exist"
-            results: dict[str, Any] = {"file": {"error": {"code": "not_found", "message": f"no file at {unit.path}"}}}
+            results = {"file": {"error": {"code": "not_found", "message": f"no file at {unit.path}"}}}
         else:
             obligations, results = close_with_checks(ctx, obligations, registry=closer_registry(ctx), judge=judge)
         ledger = UnknownsLedger(ctx.workspace.path("unknowns"))

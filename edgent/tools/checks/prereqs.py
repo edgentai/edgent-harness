@@ -77,7 +77,7 @@ def check_prereqs(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
     own = concept_list(front.get("introduces")) or (concept_list(unit.meta.get("introduces")) if unit else [])
     defects: list[dict[str, Any]] = []
     limitations: list[str] = []
-    detail: dict[str, Any] = {"unit_id": unit.id if unit else None, "requires": requires, "introduces": own}
+    detail: dict[str, Any] = {"unit_id": unit.id if unit else None, "requires": requires, "introduces": own, "untrusted": True}  # concept names come from files
     if unit is None:
         if requires:
             defects.append(defect(f"{rel}:L1", "medium", f"the file is not an outline unit (give unit_id or a unit_id front matter key); requires {requires} cannot be verified"))

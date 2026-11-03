@@ -543,10 +543,10 @@ def test_close_with_checks_honours_authority_and_external_closers(ctx: ToolConte
     obs, results = close_with_checks(ctx, film + integ + widget, registry=reg)
     by_id = {o.id: o for o in obs}
     assert by_id["film-1:render"].status == "open" and "model_inference < controlled_replay" in by_id["film-1:render"].reason
-    assert by_id["film-1:measure"].status == "open" and "check_measure is not available" in by_id["film-1:measure"].reason
+    assert by_id["film-1:measure"].status == "open" and "model_inference < controlled_replay" in by_id["film-1:measure"].reason  # closed by the same render call
     assert by_id["integ:render"].status == "closed" and by_id["integ:render"].evidence_ids == ["ev_strong"]
     assert by_id["integ:structure"].status == "open" and "unresolved references: f1" in by_id["integ:structure"].reason
-    assert by_id["w1:render"].status == "open" and "needs arguments this gate cannot derive" in by_id["w1:render"].reason
+    assert by_id["w1:render"].status == "open" and "needs arguments this gate cannot derive" in by_id["w1:render"].reason and "does not exist yet" in by_id["w1:render"].reason
     assert calls[0] == {"film_id": "film-1"} and calls[1] == {}
     assert results["film_render media/films/film-1"]["passed"] is True and "skipped" in results["widget_run media/widgets/w1.html"]
     assert results["book_build book/build"]["evidence_id"] is None

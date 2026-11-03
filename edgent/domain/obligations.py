@@ -44,18 +44,20 @@ REQUIRED_AUTHORITY: dict[str, str] = {
 }
 
 # Closer per (unit kind, obligation kind). Chapter-like kinds share the check_* tools; media and
-# assessment kinds name the tools of their modules; integration closes through the book build.
+# assessment kinds name the tools of their modules; integration closes through the book build. The media
+# tools measure as part of rendering (their ``ok`` is "no error-level measurement defect"), so one call
+# closes both the render and the measure obligation; there is no separate measuring tool.
 CLOSERS: dict[str, dict[str, str]] = {
     "chapter": {
         "structure": "check_render", "render": "check_render", "execute": "check_execute", "cite": "check_cite",
         "readability": "check_readability", "prereqs": "check_prereqs", "judge": "check_judge",
     },
-    "film": {"render": "film_render", "measure": "check_measure", "look": "film_look", "judge": "check_judge"},
-    "widget": {"render": "widget_run", "measure": "check_measure", "judge": "check_judge"},
-    "figure": {"render": "diagram_render", "measure": "check_measure"},
+    "film": {"render": "film_render", "measure": "film_render", "look": "film_look", "judge": "check_judge"},
+    "widget": {"render": "widget_run", "measure": "widget_run", "judge": "check_judge"},
+    "figure": {"render": "diagram_render", "measure": "diagram_render"},
     "exercise_set": {"keys": "assess_items_check", "judge": "check_judge"},
     "assessment": {"keys": "assess_items_check", "judge": "check_judge"},
-    "research": {"cite": "check_cite", "judge": "check_judge"},
+    "research": {"structure": "check_cite", "cite": "check_cite", "judge": "check_judge"},
     "integration": {"structure": "book_build", "render": "book_build"},
 }
 CLOSERS["section"] = CLOSERS["chapter"]
@@ -64,7 +66,7 @@ CLOSERS["lesson"] = CLOSERS["chapter"]
 # Obligation kind implied by a closer named in ``Unit.checks`` beyond the kind's defaults.
 KIND_BY_CLOSER: dict[str, str] = {
     "check_render": "render", "check_execute": "execute", "check_cite": "cite", "check_readability": "readability",
-    "check_prereqs": "prereqs", "check_judge": "judge", "check_measure": "measure", "film_look": "look",
+    "check_prereqs": "prereqs", "check_judge": "judge", "film_look": "look",
     "assess_items_check": "keys", "widget_run": "render", "diagram_render": "render", "film_render": "render",
     "book_build": "render",
 }
@@ -78,7 +80,8 @@ DEFAULT_TARGETS: dict[str, str] = {
     "integration": "book/build",
 }
 
-CITATION_RE = re.compile(r"\[([a-z0-9][a-z0-9\-_]*):(p\.\d+|t=\d{1,2}:\d{2}(?::\d{2})?|L\d+)\]")
+# Source ids are lowercase slugs (the ingest adapter lowercases them); a capitalised id in a chapter is the same source.
+CITATION_RE = re.compile(r"\[([A-Za-z0-9][A-Za-z0-9\-_]*):(p\.\d+|t=\d{1,2}:\d{2}(?::\d{2})?|L\d+)\]")
 PLACEHOLDER_RE = re.compile(r"\{\{\s*(film|widget|exercises)\s*:\s*([a-zA-Z0-9\-_]+)\s*\}\}")
 _FENCE_OPEN_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*(.*?)\s*$")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
@@ -123,6 +126,14 @@ def _closes(line: str, marker: str) -> bool:
     return len(s) >= len(marker) and s == marker[0] * len(s)
 
 
+def _dedent(line: str, indent: int) -> str:
+    """Strip up to ``indent`` leading spaces: a fence inside a list item is indented, its code is not (CommonMark)."""
+    k = 0
+    while k < indent and k < len(line) and line[k] == " ":
+        k += 1
+    return line[k:]
+
+
 def code_blocks(content: str) -> list[CodeBlock]:
     """Every fenced block with its language, expected ``output`` block and the continue marker."""
     lines = content.splitlines()
@@ -134,11 +145,12 @@ def code_blocks(content: str) -> list[CodeBlock]:
             i += 1
             continue
         marker = m.group(2)
+        indent = len(m.group(1).expandtabs(4))
         start = i
         i += 1
         body: list[str] = []
         while i < len(lines) and not _closes(lines[i], marker):
-            body.append(lines[i])
+            body.append(_dedent(lines[i], indent))
             i += 1
         closed = i < len(lines)
         end = i if closed else len(lines) - 1
@@ -168,9 +180,10 @@ def citations(content: str) -> list[dict[str, Any]]:
     seen: dict[str, dict[str, Any]] = {}
     for n, line in enumerate(strip_code(content).splitlines(), 1):
         for m in CITATION_RE.finditer(_INLINE_CODE_RE.sub("", line)):
-            loc = f"{m.group(1)}:{m.group(2)}"
+            source_id = m.group(1).lower()
+            loc = f"{source_id}:{m.group(2)}"
             if loc not in seen:
-                seen[loc] = {"locator": loc, "source_id": m.group(1), "ref": m.group(2), "line": n, "count": 0}
+                seen[loc] = {"locator": loc, "source_id": source_id, "ref": m.group(2), "line": n, "count": 0}
             seen[loc]["count"] += 1
     return list(seen.values())
 
@@ -322,6 +335,7 @@ def derive_obligations(unit: Unit, content: str | None, outline: Outline | None 
         add("keys", "every answer key is recomputed mechanically where possible", set_id=uid)
         add("judge", "an item-quality critic accepts the set", advisory=True, unit_id=uid)
     elif kind == "research":
+        add("structure", "the brief exists and its citations were checked")  # a missing brief is not a brief with nothing to cite
         for c in citations(content or ""):
             add("cite", f"citation [{c['locator']}] resolves and quotes the source", suffix=c["locator"], locator=c["locator"], line=c["line"])
         add("judge", "a contradiction check finds no unreconciled claims", advisory=True, unit_id=uid)

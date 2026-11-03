@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import json
 import re
+import typing
 from pathlib import Path
 
 import pytest
 
 from edgent import prompts
 from edgent.adapters.providers.base import find_role, role_marker
-from edgent.adapters.renderers.manim_compiler import compile_storyboard
+from edgent.adapters.renderers.manim_compiler import OP_NAMES, compile_storyboard
+from edgent.adapters.renderers.manim_render import QUALITY_FLAGS
 from edgent.adapters.renderers.svg import validate_svg
 from edgent.adapters.sandbox import run_python
 from edgent.application.skills import INDEX_LINE_MAX_CHARS, SKILL_BODY_MAX_CHARS, SkillIndex, builtin_skills_dir
@@ -17,14 +19,17 @@ from edgent.application.subagents import EFFORTS, AgentDefinition, AgentIndex, S
 from edgent.domain.capabilities import Capabilities
 from edgent.domain.errors import ConfigurationError
 from edgent.domain.learner import EVENT_TYPES
+from edgent.domain.obligations import CONTINUE_MARKER_RE, PLACEHOLDER_RE
+from edgent.domain.outline import UnitKind
 from edgent.domain.types import Message
 from edgent.domain.utils import ensure_dir, estimate_tokens, parse_front_matter, write_json
+from edgent.tools.checks.readability import GRADE_BANDS, SENTENCE_WORDS_CEILING
 from edgent.tools.checks.registry import build_checks_registry
 from edgent.tools.core import build_core_registry
 from edgent.tools.edu.assess import assess_items_check, normalise_item, validate_item
 from edgent.tools.edu.book import build_book_registry
 from edgent.tools.edu.learner import build_learner_registry
-from edgent.tools.edu.media import build_media_registry, diagram_render, widget_run
+from edgent.tools.edu.media import HOUSE_THEME_CSS, WIDGET_VIEWPORT_PX, build_media_registry, diagram_render, widget_run
 from edgent.tools.edu.sources import build_sources_registry
 from tests.conftest import skip_unless
 
@@ -292,6 +297,16 @@ def test_capability_notes_are_stable_and_optional():
     assert "images" not in prompts.capability_text(Capabilities(images=True, max_prompt_bytes=10))
 
 
+def test_load_refuses_an_oversized_prompt_file(tmp_path, monkeypatch):
+    (tmp_path / "huge.md").write_text("x" * (prompts.PROMPT_FILE_MAX_CHARS + 1), encoding="utf-8")
+    (tmp_path / "small.md").write_text("# Small\n", encoding="utf-8")
+    monkeypatch.setattr(prompts, "PROMPTS_DIR", tmp_path)
+    with pytest.raises(ConfigurationError, match="ceiling"):
+        prompts.load("huge")
+    assert prompts.load("small") == "# Small"
+    assert prompts.roles() == []
+
+
 def test_role_files_cover_every_role_and_say_what_to_return():
     for role in EXPECTED_AGENTS | set(JOB_ROLES):
         text = prompts.load(f"roles/{role}")
@@ -350,3 +365,67 @@ def test_skill_examples_render_clean_in_chromium(ctx):
     res = widget_run(ctx, {"widget_id": "bayes", "html": html, "js": js})
     assert res["tests_ran"] and res["test_failures"] == [] and res["console_errors"] == [], res["defects"]
     assert res["ok"] and res["defects"] == [], res["defects"]
+
+
+# ----------------------------------------------------------------------------- the skills describe the code that exists
+def _skill_text(name: str) -> str:
+    return (builtin_skills_dir() / name / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_reading_level_tables_match_the_checker():
+    """The band table in reading-levels is parsed row by row; the other two skills quote the same numbers."""
+    rows = re.findall(r"^\| (\w+) \| (\d+)-(\d+) \| (\d+) \|", _skill_text("reading-levels"), re.MULTILINE)
+    bands = {name: (float(lo), float(hi)) for name, lo, hi, _ in rows}
+    ceilings = {name: int(c) for name, _, _, c in rows}
+    assert bands == {k: (float(lo), float(hi)) for k, (lo, hi) in GRADE_BANDS.items()}
+    assert ceilings == SENTENCE_WORDS_CEILING
+    for name in ("book-authoring", "course-design"):
+        text = " ".join(_skill_text(name).split())  # the prose is hard-wrapped
+        for level, (lo, hi) in GRADE_BANDS.items():
+            assert f"{level} {lo:g}-{hi:g}" in text, (name, level)
+    for level, ceiling in SENTENCE_WORDS_CEILING.items():
+        assert f"{level} {ceiling}" in " ".join(_skill_text("book-authoring").split()), level
+
+
+def test_chapter_contract_matches_the_obligation_parser():
+    text = _skill_text("book-authoring")
+    assert CONTINUE_MARKER_RE.search("# edgent: continue") and "`# edgent: continue`" in text
+    for kind in ("film", "widget", "exercises"):
+        assert PLACEHOLDER_RE.search(f"{{{{{kind}: abc-1}}}}") and f"{{{{{kind}: <" in text, kind
+    assert "![caption](../../media/diagrams/<id>.svg)" in text
+    kinds = re.search(r"- Kinds: (.+?)\.\n", _skill_text("course-design"), re.DOTALL).group(1)
+    named = set(re.findall(r"`([a-z_]+)`", kinds))
+    assert named and named <= set(typing.get_args(UnitKind)), named - set(typing.get_args(UnitKind))
+
+
+def test_film_skill_names_real_ops_qualities_and_defects():
+    film, visual = _skill_text("manim-film"), _skill_text("visual-quality")
+    assert set(re.findall(r"`(\w+) \{", film)) == set(OP_NAMES)
+    for quality in QUALITY_FLAGS:
+        assert f'"{quality}"' in film, quality
+    render_src = Path(__import__("edgent.adapters.renderers.manim_render", fromlist=["x"]).__file__).read_text(encoding="utf-8")
+    for kind in ("beat_error", "still_card", "duration_mismatch", "text_overlap", "outside_safe_frame", "font_below_floor", "text_too_small", "missing_beat", "render_incomplete", "no_report"):
+        assert f'"{kind}"' in render_src and f"`{kind}`" in film and f"`{kind}`" in visual, kind
+    assert ".defects.json" in visual and "read_file" in visual
+
+
+def test_widget_skill_matches_the_house_theme_and_viewport():
+    text = _skill_text("interactive-widgets")
+    for var in re.findall(r"`(--[a-z-]+)`", text):
+        assert f"{var}:" in HOUSE_THEME_CSS, var
+    for cls in re.findall(r"`(\.[a-z]+)`", text):
+        assert cls in HOUSE_THEME_CSS, cls
+    assert f"{WIDGET_VIEWPORT_PX[0]} x {WIDGET_VIEWPORT_PX[1]}" in text
+
+
+def test_agent_bodies_do_not_claim_what_the_harness_cannot_do():
+    """A subagent starts every call in a fresh context and read_file cannot show an image."""
+    critic = (builtin_agents_dir() / "critic.md").read_text(encoding="utf-8")
+    assert "<file>.defects.json" in critic and "cannot show" in critic
+    interviewer = (builtin_agents_dir() / "interviewer.md").read_text(encoding="utf-8")
+    assert "private log" not in interviewer and "fresh context" in interviewer
+    for path in agent_files():
+        d = AgentDefinition.from_markdown(path.read_text(encoding="utf-8"), "builtin", path, default_name=path.stem)
+        if "screenshot" in d.system_prompt or "attached picture" in d.system_prompt:
+            assert set(d.tools) & {"diagram_render", "widget_run", "film_look"}, f"{d.name} is told to look at a picture it has no tool to see"
+

@@ -26,7 +26,7 @@ from ...domain.obligations import (
     ledger_summary,
 )
 from ...domain.outline import Outline, Unit
-from ...domain.utils import parse_front_matter
+from ...domain.utils import parse_front_matter, read_json
 from ..registry import B, N, S, ToolContext, ToolRegistry, ToolSpec, arr, obj, opt, validate_args
 from . import resolve_text_file
 from .cite import check_cite
@@ -51,6 +51,7 @@ REGISTRY_TIMEOUT_MARGIN_S = 30.0
 DEFECTS_IN_REASON = 3
 ADVISORY_NOT_RUN = "advisory: not run (pass judge=true, or rely on the critic round)"
 _EXTERNAL_ID_KEYS = ("film_id", "widget_id", "figure_id", "diagram_id", "set_id", "unit_id", "id")
+MEASUREMENT_SIDECAR_SUFFIX = ".defects.json"  # what diagram_render and widget_run write beside the artifact they measured
 _FAILING_EXTERNAL_SEVERITIES = frozenset({"medium", "high", "error"})
 # Closers the gate may build itself when the caller hands in no registry: verification tools that are safe to re-run.
 # The media closers (film_render, widget_run, diagram_render) create their targets from content, so they are reached
@@ -117,6 +118,9 @@ def _apply_local(closer: str, obs: list[Obligation], res: dict[str, Any]) -> Non
     if closer == "check_cite":
         entries = {e.get("locator"): e for e in (res.get("detail") or {}).get("citations") or []}
         for ob in obs:
+            if not ob.args.get("locator"):  # the whole-file obligation (a research brief's structure) takes the file verdict
+                close_obligation(ob, authority, ids, bool(res.get("passed")), "passed" + (f" ({limitation})" if limitation else "") if res.get("passed") else _first_defects(res) or "reported defects")
+                continue
             e = entries.get(ob.args.get("locator"))
             if e is None:
                 close_obligation(ob, authority, ids, False, "citation was not checked")
@@ -159,15 +163,40 @@ def _apply_external(obs: list[Obligation], out: dict[str, Any]) -> None:
     authority = str(out.get("authority") or "controlled_replay")
     ids = [x for x in [out.get("evidence_id"), *(out.get("evidence_ids") or [])] if isinstance(x, str) and x]
     verdict = out.get("passed", out.get("ok", True))  # the media and assessment tools say ok; the checks say passed
+    unresolved = out.get("unresolved_references") if isinstance(out.get("unresolved_references"), list) else None
     for ob in obs:
         passed = verdict is True
         detail = _first_defects(out) if not passed else "passed"
-        if ob.kind == "structure" and isinstance(out.get("unresolved_references"), list):
-            unresolved = out["unresolved_references"]
+        if unresolved is not None and ob.kind == "structure":
             passed = passed and not unresolved
             if unresolved:
                 detail = "unresolved references: " + ", ".join(str(r.get("id") if isinstance(r, dict) else r) for r in unresolved[:5])
+        elif unresolved and not passed and not out.get("defects") and out.get("output_path"):
+            passed, detail = True, f"built {out['output_path']}; the unresolved references are the structure obligation's"  # the book did build
         close_obligation(ob, authority, ids, passed, detail)
+
+
+def _sidecar_verdict(ctx: ToolContext, ob: Obligation) -> tuple[dict[str, Any] | None, str]:
+    """The measurement record a media tool left beside a single-file artifact, when nothing changed it since.
+
+    ``widget_run`` and ``diagram_render`` take the artifact's content as an argument, so the gate cannot re-run
+    them; it trusts their ``<artifact>.defects.json`` only while it is newer than the artifact. The second value
+    says why there is no verdict."""
+    try:
+        artifact = ctx.workspace.resolve(ob.target)
+    except Exception:  # noqa: BLE001 - a target outside the workspace is reported by the caller
+        return None, f"{ob.target} is not inside the workspace"
+    if not artifact.is_file():
+        return None, f"{ob.target} does not exist yet; build it with {ob.closer}, then mark the unit again"
+    side = artifact.with_name(artifact.name + MEASUREMENT_SIDECAR_SUFFIX)
+    if not side.is_file():
+        return None, f"{ob.target} has no measurement record ({side.name}); run {ob.closer} on it, then mark the unit again"
+    if side.stat().st_mtime < artifact.stat().st_mtime:
+        return None, f"{ob.target} changed after it was last measured; run {ob.closer} again, then mark the unit again"
+    data = read_json(side, None)
+    if not isinstance(data, dict) or not isinstance(data.get("ok"), bool):
+        return None, f"{side.name} carries no verdict; run {ob.closer} again, then mark the unit again"
+    return data, ""
 
 
 def close_with_checks(
@@ -211,9 +240,14 @@ def close_with_checks(
             results[key] = {"skipped": "closer unavailable"}
             continue
         tool_args = _external_args(spec, obs[0])
-        if tool_args is None:
-            _leave_open(obs, f"closer {closer} needs arguments this gate cannot derive; run it yourself, then mark the unit again")
-            results[key] = {"skipped": "arguments could not be derived"}
+        if tool_args is None:  # the closer takes content the gate does not have: fall back to its measurement sidecar
+            data, why = _sidecar_verdict(ctx, obs[0])
+            if data is None:
+                _leave_open(obs, f"closer {closer} needs arguments this gate cannot derive; {why}")
+                results[key] = {"skipped": "arguments could not be derived", "reason": why}
+                continue
+            _apply_external(obs, {**data, "authority": "controlled_replay"})
+            results[key] = {**compact_result({**data, "passed": data.get("ok")}), "via": "measurement sidecar"}
             continue
         r = registry.call(closer, tool_args, ctx)
         if not r.ok:
