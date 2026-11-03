@@ -10,13 +10,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Generic, TypeVar, Union
+from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 E = TypeVar("E")
 
 
-class ErrorCategory(str, Enum):
+class ErrorCategory(str, Enum):  # noqa: UP042  (str mixin keeps JSON and comparisons simple)
     invalid_input = "invalid_input"
     permission_denied = "permission_denied"
     not_found = "not_found"
@@ -130,7 +130,7 @@ class Err(Generic[E]):
         raise RuntimeError(f"unwrap on Err: {self.error}")
 
 
-Result = Union[Ok[T], Err[E]]
+Result = Ok[T] | Err[E]
 
 
 def ok(value: T) -> Ok[T]:
@@ -180,8 +180,8 @@ class Limit:
             return cls(name, default, unit, "default", env, floor, maximum, restart_required, does_not_raise)
         try:
             val = float(raw) if "." in raw else int(raw)
-        except ValueError:
-            raise ConfigurationError(f"{env} must be a number of {unit}; got {raw!r}. Correct it in the environment that starts Edgent.")
+        except ValueError as e:
+            raise ConfigurationError(f"{env} must be a number of {unit}; got {raw!r}. Correct it in the environment that starts Edgent.") from e
         if floor is not None and val < floor:
             raise ConfigurationError(f"{env}={val} is below the floor {floor} {unit}. Correct it in the environment that starts Edgent.")
         if maximum is not None and val > maximum:

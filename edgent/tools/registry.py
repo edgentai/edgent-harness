@@ -534,7 +534,7 @@ class ToolRegistry:
 
 # Convenience schema helpers used by every tool module.
 S: dict[str, Any] = {"type": "string"}
-I: dict[str, Any] = {"type": "integer"}
+I: dict[str, Any] = {"type": "integer"}  # noqa: E741
 N: dict[str, Any] = {"type": "number"}
 B: dict[str, Any] = {"type": "boolean"}
 

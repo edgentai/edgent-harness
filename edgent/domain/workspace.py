@@ -196,8 +196,8 @@ class Workspace:
         p = (self.root / s).resolve() if not os.path.isabs(s) else Path(s).resolve()
         try:
             p.relative_to(self.root)
-        except ValueError:
-            raise WorkspaceError(f"path escapes the workspace: {rel}")
+        except ValueError as e:
+            raise WorkspaceError(f"path escapes the workspace: {rel}") from e
         return p
 
     def relpath(self, p: str | os.PathLike[str]) -> str:
