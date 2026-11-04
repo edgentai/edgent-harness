@@ -18,6 +18,7 @@ from ..domain.errors import ConfigurationError, ErrorCategory, ToolFailure
 from ..domain.types import Usage
 from ..domain.utils import extract_json, parse_front_matter, truncate
 from .permissions import MODES as PERMISSION_MODES
+from .permissions import expand_tool_names
 from .sessions import Session
 from .skills import user_home
 
@@ -56,7 +57,7 @@ def _as_list(value: Any) -> list[str] | None:
 class AgentDefinition:
     name: str
     description: str = ""
-    tools: list[str] | None = None  # None = inherit every tool the parent has
+    tools: list[str] | None = None  # None = inherit every tool the parent has; "mcp__x__*" and "mcp__x" expand at spawn
     disallowed_tools: list[str] = field(default_factory=list)
     model: str | None = None
     effort: str | None = None
@@ -251,13 +252,16 @@ class SubagentRunner:
 
     # ------------------------------------------------------------------ pieces
     def child_allowlist(self, definition: AgentDefinition, parent: AgentLoop, depth: int) -> set[str]:
+        """The child's tools. Wildcards ("mcp__playwright__*") and bare connector names ("mcp__composio") expand against
+        the parent registry at spawn time, so a connector that is not configured contributes nothing."""
+        names = parent.registry.names()
         if definition.tools is not None:
-            allowed = set(definition.tools)
+            allowed = expand_tool_names(definition.tools, names)
         elif parent.allowlist is not None:
             allowed = set(parent.allowlist)
         else:
-            allowed = set(parent.registry.names())
-        allowed -= set(definition.disallowed_tools)
+            allowed = set(names)
+        allowed -= expand_tool_names(definition.disallowed_tools, names)
         allowed.discard("ask_user")
         if depth + 1 >= self.max_depth:
             allowed.discard("agent")

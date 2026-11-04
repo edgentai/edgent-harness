@@ -56,6 +56,7 @@ So a workspace can override `book-authoring` for one book, and a user can overri
 | `interactive-widgets` | making an HTML widget |
 | `narration` | text that will be heard: film narration, read-aloud, voice tutoring |
 | `reading-levels` | pitching prose at a level, or fixing a readability defect |
+| `connectors` | using an MCP connector (`mcp__...` tools): Perplexity, Firecrawl, Playwright, PostHog, Composio |
 
 ## Writing a new skill
 

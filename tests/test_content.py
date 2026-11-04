@@ -44,7 +44,7 @@ ALLOWED_AGENT_TOOLS: frozenset[str] = frozenset({
 EXPECTED_SKILLS: frozenset[str] = frozenset({
     "explaining", "book-authoring", "course-design", "socratic-tutoring", "assessment-design", "mock-interview",
     "learning-session", "deep-research", "manim-film", "visual-quality", "diagramming", "interactive-widgets",
-    "narration", "reading-levels", "study-workflow",
+    "narration", "reading-levels", "study-workflow", "connectors",
 })
 EXPECTED_AGENTS: frozenset[str] = frozenset({
     "librarian", "researcher", "author", "illustrator", "filmmaker", "critic", "examiner", "observer", "explorer", "interviewer",
@@ -200,7 +200,12 @@ def test_agent_definition_is_valid(path: Path):
     assert d.name == path.stem == meta["name"]
     assert d.description and "\n" not in meta["description"] and len(f"- {d.name}: {d.description}") <= INDEX_LINE_MAX_CHARS
     assert d.tools, "every built-in agent has an explicit allowlist"
-    assert set(d.tools) <= ALLOWED_AGENT_TOOLS, set(d.tools) - ALLOWED_AGENT_TOOLS
+    connector_patterns = {t for t in d.tools if t.startswith("mcp__")}
+    from edgent.application.connectors import PRESETS
+
+    assert all(re.fullmatch(r"mcp__([a-z][a-z0-9_-]*)__\*", t) and t.split("__")[1] in PRESETS for t in connector_patterns), connector_patterns
+    assert not connector_patterns or "tool_search" in d.tools  # connector tools may be deferred: the agent must be able to load them
+    assert set(d.tools) - connector_patterns - {"tool_search"} <= ALLOWED_AGENT_TOOLS, set(d.tools) - connector_patterns - ALLOWED_AGENT_TOOLS
     assert len(d.tools) == len(set(d.tools))
     assert d.effort in EFFORTS and isinstance(d.max_turns, int) and d.max_turns >= 1 and isinstance(d.background, bool)
     assert set(d.skills) <= EXPECTED_SKILLS, set(d.skills) - EXPECTED_SKILLS

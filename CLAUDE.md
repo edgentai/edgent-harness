@@ -7,9 +7,9 @@ Read `docs/EDU_HARNESS_PLAN.md` for the design and `docs/HARNESS_ENGINEERING_PRI
 
 ```
 edgent/domain/        pure types and rules; imports nothing else from edgent
-edgent/application/   loop, context, sessions, compaction, permissions, hooks, budgets, subagents, skills, jobs, heartbeat
+edgent/application/   loop, context, sessions, compaction, permissions, hooks, budgets, subagents, skills, jobs, heartbeat, connectors
 edgent/tools/         registry + text protocol (contracts), core tools, edu tools, checks, MCP server
-edgent/adapters/      providers, sandbox, toolchain, renderers, browser, ingest
+edgent/adapters/      providers, sandbox, toolchain, renderers, browser, ingest, mcp_client (MCP over stdio and HTTP)
 edgent/skills/        SKILL.md folders (pedagogy and craft)      edgent/agents/   subagent definitions (Markdown + front matter)
 edgent/prompts/       system prompt and behaviour spec             edgent/ui/       CLI and local web UI
 edgent/observability/ tracing and metrics                          tests/           pytest, offline, MockProvider

@@ -109,3 +109,48 @@ def test_from_settings_describe_and_errors(workspace):
         Permissions.from_settings({"mode": 3})
     with pytest.raises(ConfigurationError):
         Permissions.from_settings({"permissions": ["bash"]})
+
+
+def test_wildcard_and_connector_tool_patterns():
+    perplexity = Pattern.parse("mcp__perplexity__*")
+    assert perplexity.tool_prefix and perplexity.kind == "any" and str(perplexity) == "mcp__perplexity__*"
+    assert perplexity.matches("mcp__perplexity__perplexity_ask", "{}") and perplexity.matches("MCP__Perplexity__search", "{}")
+    assert not perplexity.matches("mcp__firecrawl__firecrawl_scrape", "{}") and not perplexity.matches("read_file", "a")
+    browser = Pattern.parse("mcp__playwright__browser_*")
+    assert browser.matches("mcp__playwright__browser_click", "{}") and not browser.matches("mcp__playwright__close", "{}")
+    assert Pattern.parse("mcp__*").matches("mcp__posthog__insights_get", "{}") and not Pattern.parse("mcp__*").matches("bash", "ls")
+    composio = Pattern.parse("mcp__composio")  # a bare server name means every tool of that connector
+    assert not composio.tool_prefix and composio.matches("mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL", "{}")
+    assert not composio.matches("mcp__composio2__x", "{}") and not composio.matches("mcp__composio_extra__x", "{}")
+    assert not Pattern.parse("mcp__composio__COMPOSIO_SEARCH_TOOLS").matches("mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL", "{}")
+    with_subject = Pattern.parse('mcp__firecrawl__*({"url":"https://docs.*)')
+    assert with_subject.kind == "prefix" and with_subject.matches("mcp__firecrawl__scrape", '{"url":"https://docs.python.org"}')
+    assert not with_subject.matches("mcp__firecrawl__scrape", '{"url":"https://evil"}') and str(Pattern.parse(str(with_subject))) == str(with_subject)
+    with pytest.raises(ConfigurationError):
+        Pattern.parse("*")  # a lone star would be a mode, not a pattern
+    with pytest.raises(ConfigurationError):
+        Pattern.parse("mcp__*__x")
+
+
+def test_connector_patterns_in_decisions(workspace):
+    multi = spec("mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL", "network")
+    ask = spec("mcp__perplexity__perplexity_ask", "network")
+    scrape = spec("mcp__firecrawl__firecrawl_scrape", "network")
+    deny = Permissions("bypass", deny=["mcp__composio"], workspace=workspace)
+    assert deny.decide(multi, {"tools": []}) == "deny" and deny.decide(ask, {}) == "allow" and deny.decide(READ, {"path": "a"}) == "allow"
+    allow = Permissions("ask", allow=["mcp__perplexity__*"], workspace=workspace)
+    assert allow.decide(ask, {"messages": []}) == "allow" and allow.decide(scrape, {"url": "u"}) == "ask" and allow.decide(multi, {}) == "ask"
+    assert allow.with_mode("auto").decide(ask, {}) == "allow" and allow.describe()["allow"] == ["mcp__perplexity__*"]
+    both = Permissions("ask", allow=["mcp__*"], deny=["mcp__firecrawl"], workspace=workspace)
+    assert both.decide(scrape, {}) == "deny" and both.decide(ask, {}) == "allow"  # deny wins over a broader allow
+
+
+def test_expand_tool_names():
+    from edgent.application.permissions import expand_tool_names, is_server_prefix
+
+    names = ["mcp__fake__a", "mcp__fake__b", "mcp__other__a", "read_file"]
+    assert expand_tool_names(["mcp__fake__*", "tool_search"], names) == {"mcp__fake__a", "mcp__fake__b", "tool_search"}
+    assert expand_tool_names(["mcp__fake"], names) == {"mcp__fake__a", "mcp__fake__b"}
+    assert expand_tool_names(["mcp__*__a"], names) == {"mcp__fake__a", "mcp__other__a"}
+    assert expand_tool_names(["mcp__absent__*", "mcp__absent"], names) == set()
+    assert is_server_prefix("mcp__my_server") and not is_server_prefix("mcp__x__y") and not is_server_prefix("mcp__") and not is_server_prefix("read_file")

@@ -75,6 +75,7 @@ class App:
             self.provider.meta = {"kind": getattr(self.provider, "name", "?"), "source": "argument", "warnings": []}  # type: ignore[attr-defined]
         self.evidence = EvidenceStore(workspace.path("evidence"))
         self.registry = self.build_registry()
+        self.connectors = self._connectors()
         self.skills = SkillIndex.discover(workspace, self.home)
         self.agents = AgentIndex.discover(workspace, self.home)
         self._events: list[dict[str, Any]] = []
@@ -146,9 +147,34 @@ class App:
             return tracer
 
     def build_allow(self) -> list[str]:
-        """Patterns a build session may use without anyone to ask: the network tools, unless settings.build.network is false."""
+        """Patterns a build session may use without anyone to ask: the network tools and the read-only connector
+        tools (search, scrape, read), unless settings.build.network is false. Connector actions always ask."""
         build = self.settings.get("build") if isinstance(self.settings.get("build"), dict) else {}
-        return list(BUILD_NETWORK_TOOLS) if build.get("network", True) else []
+        if not build.get("network", True):
+            return []
+        readonly = [s.name for s in self.registry.specs("connector") if not s.side_effects]
+        return [*BUILD_NETWORK_TOOLS, *readonly]
+
+    def _connectors(self) -> Any:
+        """Connectors from settings, registered from their cached tool lists; nothing starts until a call or a loop needs it."""
+        from .connectors import ConnectorManager
+
+        manager = ConnectorManager(self.workspace, self.settings, self.home, on_event=self.emit)
+        try:
+            manager.attach(self.registry)
+        except Exception as e:  # noqa: BLE001 - a broken connector entry never stops Edgent; the doctor shows it
+            self.emit({"type": "connector", "event": "error", "error": str(e)[:300]})
+        return manager
+
+    def ensure_connectors(self) -> None:
+        """Before a loop's first request: list the connectors that were never listed (bounded; failures are reported, not raised)."""
+        try:
+            self.connectors.ensure_once()
+        except Exception as e:  # noqa: BLE001
+            self.emit({"type": "connector", "event": "error", "error": str(e)[:300]})
+
+    def close(self) -> None:
+        self.connectors.close_all()
 
     # ------------------------------------------------------------------ progress events (for UIs polling a process)
     def emit(self, event: dict[str, Any]) -> None:
@@ -202,6 +228,7 @@ class App:
         from .loop import AgentLoop
         from .permissions import Permissions
 
+        self.ensure_connectors()
         tracer = self.tracer(session.session_id)
         permissions = self.permissions(permission_mode)
         if allow:
@@ -402,4 +429,5 @@ class App:
         report["skills"] = self.skills.names()
         report["agents"] = self.agents.names()
         report["tools"] = len(self.registry.names())
+        report["connectors"] = self.connectors.status()
         return report

@@ -1,7 +1,8 @@
 """Context assembly: the prompt is a view of state, built fresh each call, most stable material first.
 
 Message 1 (system) is byte-identical for the whole session: system prompt,
-skill index, subagent index. Message 2 (system) is the workspace instruction
+skill index, subagent index, and the deferred-tool index (which changes only
+when tool_search loads a tool). Message 2 (system) is the workspace instruction
 chain. Message 3 (system) is the orientation block read from files (index of
 sources, outline summary, progress tail, git status), labelled as data.
 Message 4 (system) carries the compaction notes and the stance, only when
@@ -76,9 +77,10 @@ class ContextAssembler:
         *,
         orientation_max_chars: int | None = None,
         notes_max_chars: int | None = None,
+        tools_index: str = "",
     ) -> list[Message]:
         extra = extra_context or {}
-        out = [Message.system(self.stable_prompt(system_prompt, skills_index, agents_index))]
+        out = [Message.system(self.stable_prompt(system_prompt, skills_index, agents_index, tools_index))]
         instructions = self.instructions_text(workspace, extra.get("subdir"))
         if instructions:
             out.append(Message.system(instructions))
@@ -90,8 +92,9 @@ class ContextAssembler:
         return out
 
     @staticmethod
-    def stable_prompt(system_prompt: str, skills_index: str = "", agents_index: str = "") -> str:
-        return "\n\n".join(part.strip() for part in (system_prompt, skills_index, agents_index) if part and part.strip())
+    def stable_prompt(system_prompt: str, skills_index: str = "", agents_index: str = "", tools_index: str = "") -> str:
+        parts = (system_prompt, skills_index, agents_index, tools_index)
+        return "\n\n".join(part.strip() for part in parts if part and part.strip())
 
     def instructions_text(self, workspace: Workspace, subdir: str | None = None) -> str:
         sections = [f"### {path}\n{text.strip()}" for path, text in workspace.instruction_chain(subdir=subdir) if text.strip()]
@@ -206,6 +209,7 @@ class ContextAssembler:
         agents_index: str = "",
         extra_context: dict[str, Any] | None = None,
         caps: Capabilities | None = None,
+        tools_index: str = "",
     ) -> CompletionRequest:
         metadata: dict[str, Any] = {"role": role, "session_id": session.session_id}
         if session.meta.get("unit_id"):
@@ -214,7 +218,7 @@ class ContextAssembler:
         def make(orientation_cap: int | None, notes_cap: int | None) -> CompletionRequest:
             messages = self.assemble(
                 session, workspace, system_prompt, skills_index, agents_index, extra_context, caps,
-                orientation_max_chars=orientation_cap, notes_max_chars=notes_cap,
+                orientation_max_chars=orientation_cap, notes_max_chars=notes_cap, tools_index=tools_index,
             )
             return CompletionRequest(messages=messages, tools=list(tool_schemas), effort=effort, max_tokens=max_tokens, metadata=metadata)  # type: ignore[arg-type]
 

@@ -21,7 +21,14 @@ from ..domain.evidence import EvidenceStore
 from ..domain.types import ContentPart, Message, Reply, ToolCall, Usage
 from ..domain.utils import Clock, truncate
 from ..domain.workspace import Workspace
-from ..tools.registry import PermissionPolicy, ToolContext, ToolRegistry, ToolResult
+from ..tools.registry import (
+    ACTIVATED_TOOLS_KEY,
+    TOOL_SEARCH_NAME,
+    PermissionPolicy,
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+)
 from .budgets import Budget, BudgetExhausted, BudgetTracker
 from .compaction import Compactor
 from .context import ContextAssembler, ContextTooLarge
@@ -168,7 +175,13 @@ class AgentLoop:
             metrics=self.metrics,
             session=self.session,
             skills=self.skills,
+            # tool_search reads these: it offers only what this loop may call
+            extra={"registry": self.registry, "allowlist": set(self.allowlist) if self.allowlist is not None else None},
         )
+
+    def activated_tools(self) -> set[str]:
+        """Deferred tools this session loaded with tool_search; a subagent has its own session, so it starts with none."""
+        return {str(n) for n in self.session.meta.get(ACTIVATED_TOOLS_KEY) or []}
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -254,19 +267,23 @@ class AgentLoop:
         caps = self.provider.caps
         # compact schemas only where bytes are scarce: parameter descriptions are how the model learns units and ranges
         compact = self.context.config.compact_schemas and bool(caps.max_prompt_bytes)
+        visible = self._visible_tools()
+        activated = self.activated_tools()
         try:
             request = self.context.build_request(
                 self.session,
                 self.workspace,
                 system_prompt=self.system_prompt,
-                tool_schemas=self.registry.openai_schemas(self.allowlist, compact=compact),
+                tool_schemas=self.registry.openai_schemas(self.allowlist, compact=compact, activated=activated),
                 effort=self.effort,  # type: ignore[arg-type]
                 max_tokens=self.max_tokens,
                 role=self.role,
                 skills_index=self.skills.index_text() if self.skills is not None else "",
-                agents_index=self.agents.index_text() if self.agents is not None and "agent" in self._visible_tools() else "",
+                agents_index=self.agents.index_text() if self.agents is not None and "agent" in visible else "",
                 extra_context=extra_context,
                 caps=caps,
+                # without tool_search a deferred tool cannot be loaded, so naming it would only invite a failed call
+                tools_index=self.registry.deferred_index(self.allowlist, activated) if TOOL_SEARCH_NAME in visible else "",
             )
         except ContextTooLarge:
             if not allow_compaction:

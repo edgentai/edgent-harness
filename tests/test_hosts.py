@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import sys
 import tomllib
@@ -505,6 +506,9 @@ def test_builtin_agents_rewrite_to_tools_the_mcp_server_serves(workspace):
         assert rewritten.system_prompt == original.system_prompt and rewritten.skills == original.skills and rewritten.max_turns == original.max_turns
         assert original.tools and rewritten.tools, f.name
         for tool in rewritten.tools:
+            if tool.startswith("mcp__") and not tool.startswith(MCP_TOOL_PREFIX):
+                assert re.fullmatch(r"mcp__[a-z][a-z0-9_-]*", tool), (f.name, tool)  # the host's own connector, server-wide
+                continue
             assert tool.startswith(MCP_TOOL_PREFIX) or tool[0].isupper(), (f.name, tool)  # a Claude Code name, never a bare Edgent id
             if tool.startswith(MCP_TOOL_PREFIX):
                 assert tool[len(MCP_TOOL_PREFIX) :] in served, (f.name, tool)

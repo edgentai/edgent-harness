@@ -527,3 +527,22 @@ def test_build_book_prompt_matches_the_tool_contracts():
     assert reg.get("run_checks").parameters["required"] == ["path"]  # the contract the prompt is held to
     assert "path=<unit path>" in next(s for s in steps if "run_checks" in s) and "unit_id=<unit_id>" in next(s for s in steps if "run_checks" in s)
     assert "its brief states the unit's path" in next(s for s in steps if "book_unit_brief" in s)
+
+
+def test_connector_tools_and_tool_search_are_never_advertised_or_reexported(workspace, ctx: ToolContext):
+    from edgent.tools.registry import TOOL_SEARCH_NAME, ToolSpec
+
+    reg = make_registry(workspace)
+    reg.register(ToolSpec(name="mcp__fake__scrape", description="Scrape a page.", parameters=obj({}), fn=lambda c, a: {"scraped": True},
+                          deferred=True, origin="connector:fake"))
+    reg.register(ToolSpec(name="local_extra", description="A non-connector tool with an origin.", parameters=obj({}), fn=lambda c, a: {"ok": True},
+                          origin="plugin:x"))
+    assert TOOL_SEARCH_NAME in reg.names()  # brought by the deferred tool, hidden from the host below
+    server = MCPServer(reg, lambda: ctx, page_size=100)
+    listed = [t["name"] for t in server.handle(req(1, "tools/list"))["result"]["tools"]]
+    assert "mcp__fake__scrape" not in listed and TOOL_SEARCH_NAME not in listed and {"echo", "local_extra"} <= set(listed)
+    assert server.advertised_tool_names() == listed
+    refused = server.handle(req(2, "tools/call", {"name": "mcp__fake__scrape", "arguments": {}}))["result"]
+    err = json.loads(refused["content"][0]["text"])["error"]
+    assert refused["isError"] is True and err["code"] == "permission_denied" and "connector" in err["message"] and err["remediation"]
+    assert server.handle(req(3, "tools/call", {"name": "local_extra", "arguments": {}}))["result"]["isError"] is False

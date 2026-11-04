@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -27,6 +28,19 @@ PERMISSION_CLASSES = ("read", "compute", "write", "network", "spawn", "interacti
 DANGEROUS = {"network", "delete"}
 MAX_INLINE_OUTPUT_CHARS = 6000
 COMPACT_SCHEMA_MAX_DEPTH = 10
+# Deferred tools (connector tools, mostly) are registered but their schemas are sent only once tool_search loads them;
+# until then the model sees one line per tool in this index, which must stay small next to a 128 KB prompt ceiling.
+TOOL_SEARCH_NAME = "tool_search"
+ACTIVATED_TOOLS_KEY = "activated_tools"  # Session.meta key: deferred tools tool_search loaded in that session
+DEFERRED_INDEX_HEADER = "## Deferred tools (load their schemas with tool_search before calling them)"
+DEFERRED_INDEX_HINT = (
+    'Call tool_search with "select:<name>[,<name>]" to load the tools you will use, or with keywords to find one; '
+    "then call them directly."
+)
+DEFERRED_INDEX_MAX_CHARS = 12_000
+DEFERRED_INDEX_DESCRIPTION_MAX_CHARS = 100
+DEFERRED_INDEX_TAIL_RESERVE_CHARS = 100  # room kept under the cap for the "… N more" line
+_FIRST_SENTENCE_RE = re.compile(r"^(.+?[.!?])(?:\s|$)")
 
 Decision = Literal["allow", "deny", "ask"]
 
@@ -105,6 +119,15 @@ class ToolSpec:
     group: str = "core"  # core | sources | book | media | assess | learner | checks | session | custom
     attaches_media: bool = False
     max_inline_chars: int | None = None  # per-tool inline output ceiling (chars); None means MAX_INLINE_OUTPUT_CHARS
+    deferred: bool = False  # schema sent only after tool_search activates it; the name appears in the deferred index
+    origin: str = ""  # where the tool comes from, e.g. "connector:perplexity"; empty for built-in tools
+
+    def first_sentence(self, max_chars: int = DEFERRED_INDEX_DESCRIPTION_MAX_CHARS) -> str:
+        """The description's first sentence on one line, cut at ``max_chars``: what an index line shows."""
+        text = " ".join(self.description.split())
+        m = _FIRST_SENTENCE_RE.match(text)
+        sentence = m.group(1) if m else text
+        return sentence if len(sentence) <= max_chars else sentence[: max(0, max_chars - 1)].rstrip() + "…"
 
     def full_description(self) -> str:
         desc = self.description.strip()
@@ -327,6 +350,7 @@ class IdempotencyStore:
 class ToolRegistry:
     def __init__(self, idempotency: IdempotencyStore | None = None, ids: IdGenerator | None = None, metrics: Any = None, max_workers: int = 16) -> None:
         self._tools: dict[str, ToolSpec] = {}
+        self._define_lock = threading.RLock()  # connectors may register or remove tools while a loop reads the list
         self.idempotency = idempotency
         self.ids = ids or IdGenerator()
         self.metrics = metrics
@@ -338,12 +362,28 @@ class ToolRegistry:
 
     # ------------------------------------------------------------------ definition
     def register(self, spec: ToolSpec) -> ToolSpec:
+        """Add one tool. The first deferred tool also brings ``tool_search``: without it a deferred tool cannot be loaded."""
         if spec.permission not in PERMISSION_CLASSES:
             raise ValueError(f"unknown permission class {spec.permission!r} for tool {spec.name}")
-        if spec.name in self._tools:
-            raise ValueError(f"tool {spec.name!r} is already registered")
-        self._tools[spec.name] = spec
+        with self._define_lock:
+            if spec.name in self._tools:
+                raise ValueError(f"tool {spec.name!r} is already registered")
+            self._tools[spec.name] = spec
+            if spec.deferred:
+                self._ensure_tool_search()
         return spec
+
+    def unregister(self, name: str) -> bool:
+        """Remove a tool (a connector that disconnected); True when it was registered."""
+        with self._define_lock:
+            return self._tools.pop(name, None) is not None
+
+    def _ensure_tool_search(self) -> None:
+        if TOOL_SEARCH_NAME in self._tools:
+            return
+        from .core import tool_search_spec  # imported here: core builds on this module
+
+        self._tools[TOOL_SEARCH_NAME] = tool_search_spec()
 
     def tool(self, name: str, description: str, parameters: dict[str, Any], **kw: Any) -> Callable[[ToolFn], ToolFn]:
         """Decorator form: ``@registry.tool("read_file", "...", schema, permission="read")``."""
@@ -355,9 +395,12 @@ class ToolRegistry:
         return deco
 
     def include(self, other: ToolRegistry) -> None:
-        for spec in other.specs():
-            if spec.name not in self._tools:
-                self._tools[spec.name] = spec
+        with self._define_lock:
+            for spec in other.specs():
+                if spec.name not in self._tools:
+                    self._tools[spec.name] = spec
+                    if spec.deferred:
+                        self._ensure_tool_search()
 
     def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
@@ -368,8 +411,53 @@ class ToolRegistry:
     def specs(self, group: str | None = None) -> list[ToolSpec]:
         return [t for _, t in sorted(self._tools.items()) if group is None or t.group == group]
 
-    def openai_schemas(self, allowlist: set[str] | None = None, compact: bool = False) -> list[dict[str, Any]]:
-        return [t.openai_schema(compact) for n, t in sorted(self._tools.items()) if allowlist is None or n in allowlist]
+    def openai_schemas(self, allowlist: set[str] | None = None, compact: bool = False, activated: set[str] | None = None) -> list[dict[str, Any]]:
+        """Schemas to send: every allowed tool, except a deferred one whose name is not in ``activated`` (None: none are)."""
+        return [
+            t.openai_schema(compact)
+            for n, t in sorted(self._tools.items())
+            if (allowlist is None or n in allowlist) and (not t.deferred or (activated is not None and n in activated))
+        ]
+
+    def deferred_names(self, allowlist: set[str] | None = None) -> list[str]:
+        return [n for n, t in sorted(self._tools.items()) if t.deferred and (allowlist is None or n in allowlist)]
+
+    def deferred_index(self, allowlist: set[str] | None = None, activated: set[str] | None = None, max_chars: int = DEFERRED_INDEX_MAX_CHARS) -> str:
+        """A Markdown section naming the allowed deferred tools not yet activated, grouped by origin; "" when there are none.
+
+        One line per tool with the first sentence of its description. Over ``max_chars`` (chars) the lines lose their
+        descriptions, and past that the tail is counted instead of listed (tool_search keywords still find it)."""
+        loaded = activated or set()
+        pending = [self._tools[n] for n in self.deferred_names(allowlist) if n not in loaded]
+        if not pending:
+            return ""
+        groups: dict[str, list[ToolSpec]] = {}
+        for spec in sorted(pending, key=lambda t: (t.origin or "built-in", t.name)):
+            groups.setdefault(spec.origin or "built-in", []).append(spec)
+        for with_descriptions in (True, False):
+            lines = [DEFERRED_INDEX_HEADER, DEFERRED_INDEX_HINT]
+            for origin, specs in groups.items():
+                lines.append(f"### {origin}")
+                lines.extend(f"- {t.name}: {t.first_sentence()}" if with_descriptions else f"- {t.name}" for t in specs)
+            text = "\n".join(lines)
+            if len(text) <= max_chars:
+                return text
+        return self._capped_index(lines, len(pending), max_chars)
+
+    @staticmethod
+    def _capped_index(lines: list[str], total: int, max_chars: int) -> str:
+        kept: list[str] = []
+        size = 0
+        for line in lines:
+            if size + len(line) + 1 > max_chars - DEFERRED_INDEX_TAIL_RESERVE_CHARS:
+                break
+            kept.append(line)
+            size += len(line) + 1
+        if kept and kept[-1].startswith("### "):
+            kept.pop()  # an origin heading with none of its tools under it
+        listed = sum(1 for line in kept if line.startswith("- "))
+        kept.append(f"- … {total - listed} more deferred tools not listed here; find them with tool_search keywords")
+        return "\n".join(kept)
 
     def mcp_manifest(self, compact: bool = False, allowlist: set[str] | None = None) -> dict[str, Any]:
         return {"tools": [t.mcp_schema(compact) for n, t in sorted(self._tools.items()) if allowlist is None or n in allowlist]}

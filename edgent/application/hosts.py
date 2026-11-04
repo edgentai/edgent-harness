@@ -63,6 +63,7 @@ CLAUDE_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "todo_read": ("TodoWrite",),
     "session_recall": (),
     "remember": (),
+    "tool_search": ("ToolSearch",),  # Claude Code loads deferred tool schemas with its own ToolSearch
 }
 _AGENT_TOOL_KEYS = ("tools", "disallowedTools", "disallowed_tools")
 _AGENT_EDGENT_ONLY_KEYS = ("effort",)  # front-matter keys Claude Code does not define; name, description, skills, maxTurns, background and model it does
@@ -366,6 +367,12 @@ def claude_tool_names(names: list[str]) -> list[str]:
     """Edgent tool ids as Claude Code's allowlist names: the host-native tool where one exists, the MCP name otherwise."""
     out: list[str] = []
     for name in names:
+        if name.startswith("mcp__") and not name.startswith(MCP_TOOL_PREFIX):
+            # an Edgent connector pattern (mcp__perplexity__*) means the host's own connector of that name, server-wide
+            server = name.rstrip("*").rstrip("_")
+            if server not in out:
+                out.append(server)
+            continue
         for mapped in CLAUDE_TOOL_NAMES.get(name, (f"{MCP_TOOL_PREFIX}{name}",)):
             if mapped not in out:
                 out.append(mapped)

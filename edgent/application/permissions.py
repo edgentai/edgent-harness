@@ -6,9 +6,15 @@ The subject of a call is the command for ``bash``, the path or pattern for the
 file tools, the url or query for web tools, the agent name for ``agent``, and
 otherwise the canonical JSON of the arguments. Tool names match
 case-insensitively, subjects case-sensitively.
+
+The tool part may end in ``*`` to match every tool whose name starts with what
+precedes it (``mcp__playwright__browser_*``, ``mcp__*``), and a bare server name
+``mcp__<server>`` matches every tool of that connector (``mcp__<server>__...``),
+as in Claude Code. A lone ``*`` is refused: it would be a mode, not a pattern.
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -40,7 +46,38 @@ SUBJECT_KEYS: dict[str, tuple[str, ...]] = {
 }
 WEB_KEYS = ("url", "query")
 
-_PATTERN_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*(?:\((.*)\))?\s*$", re.DOTALL)
+_PATTERN_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)(\*)?\s*(?:\((.*)\))?\s*$", re.DOTALL)
+MCP_TOOL_PREFIX = "mcp__"  # connector tools are named mcp__<server>__<tool>
+MCP_NAME_SEPARATOR = "__"
+
+
+def is_server_prefix(name: str) -> bool:
+    """True for a bare connector name such as ``mcp__composio``: the mcp prefix and a server, but no tool part."""
+    return name.lower().startswith(MCP_TOOL_PREFIX) and len(name) > len(MCP_TOOL_PREFIX) and MCP_NAME_SEPARATOR not in name[len(MCP_TOOL_PREFIX) :]
+
+
+def tool_name_matches(pattern_tool: str, tool_name: str, prefix: bool = False) -> bool:
+    """Case-insensitive tool-name match: exact, a ``*`` prefix (``prefix=True``), or every tool of a bare server name."""
+    pattern, name = pattern_tool.lower(), tool_name.lower()
+    if prefix:
+        return name.startswith(pattern)
+    return name == pattern or (is_server_prefix(pattern) and name.startswith(pattern + MCP_NAME_SEPARATOR))
+
+
+def expand_tool_names(entries: Iterable[str], names: Iterable[str]) -> set[str]:
+    """Allowlist entries as concrete names: an entry with ``*`` is an fnmatch pattern over ``names``, a bare
+    ``mcp__<server>`` stands for that server's tools, and anything else is kept as written. A pattern that matches
+    nothing contributes nothing: a connector that is not configured simply has no tools."""
+    known = list(names)
+    out: set[str] = set()
+    for entry in entries:
+        if "*" in entry:
+            out.update(n for n in known if fnmatch.fnmatchcase(n.lower(), entry.lower()))
+        elif is_server_prefix(entry):
+            out.update(n for n in known if tool_name_matches(entry, n))
+        else:
+            out.add(entry)
+    return out
 
 
 def shell_segments(command: str) -> list[str]:
@@ -65,24 +102,30 @@ def subject_of(tool_name: str, args: dict[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class Pattern:
-    tool: str  # lower-cased tool name
-    kind: str  # any | prefix | exact
+    tool: str  # lower-cased tool name, or the name prefix when tool_prefix is set
+    kind: str  # any | prefix | exact (how the subject matches)
     subject: str = ""
+    tool_prefix: bool = False  # the tool part ended in "*": match every tool name starting with ``tool``
 
     @classmethod
     def parse(cls, text: str) -> Pattern:
         m = _PATTERN_RE.match(text or "")
         if not m:
-            raise ConfigurationError(f"invalid permission pattern {text!r}; use tool, tool(*), tool(prefix *) or tool(exact)")
-        tool, inner = m.group(1).lower(), m.group(2)
+            raise ConfigurationError(
+                f"invalid permission pattern {text!r}; use tool, tool(*), tool(prefix *), tool(exact), a tool-name prefix such as mcp__playwright__browser_*, or a connector such as mcp__composio"
+            )
+        tool, star, inner = m.group(1).lower(), bool(m.group(2)), m.group(3)
         if inner is None or inner.strip() == "*":
-            return cls(tool, "any")
+            return cls(tool, "any", tool_prefix=star)
         if inner.endswith("*"):
-            return cls(tool, "prefix", inner[:-1])
-        return cls(tool, "exact", inner)
+            return cls(tool, "prefix", inner[:-1], tool_prefix=star)
+        return cls(tool, "exact", inner, tool_prefix=star)
+
+    def matches_tool(self, tool_name: str) -> bool:
+        return tool_name_matches(self.tool, tool_name, self.tool_prefix)
 
     def matches(self, tool_name: str, subject: str) -> bool:
-        if self.tool != tool_name.lower():
+        if not self.matches_tool(tool_name):
             return False
         if self.kind == "any":
             return True
@@ -91,9 +134,10 @@ class Pattern:
         return subject == self.subject
 
     def __str__(self) -> str:
+        tool = f"{self.tool}*" if self.tool_prefix else self.tool
         if self.kind == "any":
-            return self.tool
-        return f"{self.tool}({self.subject}{'*' if self.kind == 'prefix' else ''})"
+            return tool
+        return f"{tool}({self.subject}{'*' if self.kind == 'prefix' else ''})"
 
 
 class Permissions:

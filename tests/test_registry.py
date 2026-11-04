@@ -143,3 +143,15 @@ def test_compact_schema():
     c = compact_schema(schema)
     assert c["description"] == "root" and "description" not in c["properties"]["a"] and c["properties"]["b"]["properties"]["c"]["minimum"] == 0
     assert c["required"] == ["a"] and c["additionalProperties"] is False
+
+
+def test_deferred_specs_are_withheld_until_activated(workspace):
+    reg = make_registry(workspace)[0]
+    assert ToolSpec(name="t", description="d", parameters=obj({}), fn=lambda c, a: {}).deferred is False
+    before = reg.schema_bytes()
+    reg.register(ToolSpec(name="mcp__x__y", description="Y does z. More.", parameters=obj({}), fn=lambda c, a: {}, deferred=True, origin="connector:x"))
+    assert "tool_search" in reg.names() and reg.deferred_names() == ["mcp__x__y"]
+    assert "mcp__x__y" not in [s["function"]["name"] for s in reg.openai_schemas()]
+    assert "mcp__x__y" in [s["function"]["name"] for s in reg.openai_schemas(activated={"mcp__x__y"})]
+    assert reg.schema_bytes() > before  # tool_search itself is sent; the deferred schema is not
+    assert "- mcp__x__y: Y does z." in reg.deferred_index() and reg.unregister("mcp__x__y") and reg.deferred_index() == ""

@@ -47,7 +47,7 @@ edgent serve                               # the local reader: chapters, chat ab
 
 Every answer about the sources cites a locator such as `textbook:p.12` or `lecture:t=00:14:32`; a locator that does not resolve is a defect the checks catch. What the sources do not cover is said to be beyond them.
 
-Other commands: `edgent status`, `edgent outline`, `edgent walkthrough` (the unknowns ledger), `edgent sessions`, `edgent trace <session>`, `edgent skills [agents]`, `edgent heartbeat`, `edgent eval evals/golden`, `edgent setup --host claude|agy|codex|cursor` and `edgent mcp`. Global options (`--workspace`, `--provider`, `--model`, `--effort low|medium|high`, `--mode`, `-v`) go before or after the command.
+Other commands: `edgent connectors` (Perplexity, Playwright, Firecrawl, PostHog, Composio and any MCP server; see Connectors below), `edgent status`, `edgent outline`, `edgent walkthrough` (the unknowns ledger), `edgent sessions`, `edgent trace <session>`, `edgent skills [agents]`, `edgent heartbeat`, `edgent eval evals/golden`, `edgent setup --host claude|agy|codex|cursor` and `edgent mcp`. Global options (`--workspace`, `--provider`, `--model`, `--effort low|medium|high`, `--mode`, `-v`) go before or after the command.
 
 ## The workspace
 
@@ -78,7 +78,7 @@ A workspace can hold a codebase too: the same `read_file`, `edit_file`, `grep`, 
 
 ## Skills, agents, prompts
 
-Pedagogy and craft live in Markdown, not in code. `edgent/skills/` holds fifteen skills (explaining, socratic tutoring, book authoring, course design, assessment design, mock interviews, learning sessions, deep research, Manim films, diagrams, interactive widgets, narration, reading levels, visual quality, the study workflow); the model sees a short index in every prompt and loads a body with the `skill` tool when it matches. `edgent/agents/` defines ten subagents (librarian, explorer, researcher, author, critic, examiner, filmmaker, illustrator, interviewer, observer), each with its own tool allowlist and effort; a subagent returns a summary, never its transcript. `edgent/prompts/` holds the system prompt, the behaviour spec and the role prompts. A workspace (`.edgent/skills`, `.edgent/agents`) or a user (`~/.edgent/`) overrides any of them by name.
+Pedagogy and craft live in Markdown, not in code. `edgent/skills/` holds sixteen skills (explaining, socratic tutoring, book authoring, course design, assessment design, mock interviews, learning sessions, deep research, Manim films, diagrams, interactive widgets, narration, reading levels, visual quality, the study workflow, connectors); the model sees a short index in every prompt and loads a body with the `skill` tool when it matches. `edgent/agents/` defines ten subagents (librarian, explorer, researcher, author, critic, examiner, filmmaker, illustrator, interviewer, observer), each with its own tool allowlist and effort; a subagent returns a summary, never its transcript. `edgent/prompts/` holds the system prompt, the behaviour spec and the role prompts. A workspace (`.edgent/skills`, `.edgent/agents`) or a user (`~/.edgent/`) overrides any of them by name.
 
 ## Settings
 
@@ -96,6 +96,39 @@ Pedagogy and craft live in Markdown, not in code. `edgent/skills/` holds fifteen
 ```
 
 Permission modes are `ask` (writes and commands need approval), `accept-edits` (writes inside the workspace go ahead, commands and the network ask), `auto` (everything but the network and deletes), `plan` (read-only) and `bypass`. `edgent chat` and `edgent run --interactive` ask on the console; `edgent run` without a console and the web reader have nobody to ask, so they use `accept-edits` unless a mode is configured. A `bash` call that asks for the network is judged as a network request. Writes into `.edgent/` (settings, hooks, skills, agents) always ask: the model never widens its own permissions. Deny patterns on `bash` match every command in a shell line, not only its start. Every ceiling is a named limit with a unit; a failure message says the effective value and the next action.
+
+## Connectors
+
+Connectors bring outside MCP servers into Edgent: their tools appear to the model as `mcp__<connector>__<tool>`, under the same permission policy as Edgent's own tools. Five ship as presets:
+
+| Preset | What it adds | Runs | Needs |
+|---|---|---|---|
+| `perplexity` | web search with dates and citations, quick cited answers, reasoning, multi-source research reports | hosted (`https://api.perplexity.ai/mcp`), or local with `--variant local` | `PERPLEXITY_API_KEY` |
+| `playwright` | a real browser driven through accessibility snapshots: navigate, click, type, fill forms, console, network, screenshots | local (`npx @playwright/mcp`), headless, isolated, pointed at the Chromium Edgent finds | Node.js 18+ |
+| `firecrawl` | pages as clean Markdown (JavaScript included), site maps and crawls, web and paper search, document parsing | hosted (`https://mcp.firecrawl.dev/v2/mcp`), or `search` and `local` variants | nothing for the free tier; `FIRECRAWL_API_KEY` for crawl, map and agent |
+| `posthog` | product analytics for a site or course: insights, SQL, dashboards, flags, experiments, errors, surveys | hosted (`https://mcp.posthog.com/mcp`), read-only and single-tool mode by default | `POSTHOG_API_KEY` (personal key, "MCP Server" preset) |
+| `composio` | acting in 1000+ apps (Gmail, Drive, GitHub, Slack, Notion...) through seven meta-tools | hosted (`https://connect.composio.dev/mcp`), or a session URL with `--variant session` | `COMPOSIO_CONSUMER_KEY` |
+
+```bash
+export PERPLEXITY_API_KEY=pplx-...        # keys live in the environment, never in settings files
+edgent connectors add perplexity          # writes a ${PERPLEXITY_API_KEY} reference, connects, lists the tools
+edgent connectors add playwright --allow  # --allow: its tools run without asking (permissions.allow)
+edgent connectors add firecrawl
+edgent connectors                         # state of each: ready, needs a key, error
+edgent connectors presets | test <name> | tools <name> | refresh | remove <name>
+edgent connectors add mydocs --url https://example.com/mcp --header "Authorization=Bearer \${MY_TOKEN}"
+edgent connectors add local-db --command npx --env "DB_URL=\${DB_URL}" -- -y some-mcp-server
+```
+
+The settings entry is small and holds no secret (`{"connectors": {"perplexity": {"preset": "perplexity"}}}`); `${VAR}` and `${VAR:-default}` are expanded when a connector starts, and every expanded value is redacted from errors and traces. Claude-style `mcpServers` entries pasted into `.edgent/settings.json` work too. A local server sees only the environment it needs (PATH, HOME, locale, proxy and CA settings) plus its own `env`, never your other keys.
+
+How they behave:
+
+- **Nothing starts at launch.** Tool lists are cached per workspace; a server starts on its first call and stops when Edgent exits. A connector that was never listed is listed before the first model call, bounded by a timeout.
+- **Large tool sets are deferred.** A connector with more than eight tools (Firecrawl, Playwright, most custom servers) is listed by name only; the model loads the schemas it needs with `tool_search`, so a session does not pay for fifty schemas on every call. Set `"expose": "all"` or `"deferred"` per connector to override.
+- **Permissions.** Read-only tools of the shipped presets run like `web_fetch` (allowed in build sessions, asked about in `ask` mode); everything else asks unless you allow it with a pattern such as `mcp__playwright` or `mcp__perplexity__perplexity_search`. Deny patterns work the same way (`"deny": ["mcp__composio"]`). Annotations from servers you configured yourself are not believed unless you set `"trust_annotations": true`.
+- **Untrusted results.** Connector output is marked untrusted, images come back as attachments the model can see (saved under `.edgent/cache/connectors/`), large results are stored and previewed, and the `connectors` skill tells the model when each connector earns its cost, to cite pages only after adding them as sources, and to confirm before anything Composio or PostHog would send, post or change.
+- **Protocol.** The client speaks MCP over stdio and Streamable HTTP, opens with the `initialize` handshake (revisions 2024-11-05 to 2025-11-25, which every official server speaks today) and moves to the stateless 2026-07-28 revision when a server asks for it. It sends keys as headers and does not run OAuth; the deprecated HTTP+SSE transport is not supported.
 
 ## Hosting the tools elsewhere
 

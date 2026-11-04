@@ -354,8 +354,145 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("workspace: none here (run `edgent init`)")
     else:
         print(f"workspace: {report['workspace']['root']}  git: {report['workspace']['git']}  skills: {len(report.get('skills', []))}  agents: {len(report.get('agents', []))}  tools: {report.get('tools', 0)}")
+    for c in report.get("connectors") or []:
+        print(f"connector {c['name']:12s} {_connector_state(c)}")
     if "host" in report:
         print(f"host {args.host}: {json.dumps(report['host'], indent=2, default=str)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- connectors
+def _connector_state(c: dict[str, Any]) -> str:
+    if not c.get("enabled", True):
+        return "disabled"
+    if c.get("problem"):
+        return f"invalid: {c['problem']}"
+    if c.get("missing"):
+        return f"needs {', '.join(c['missing'])}" + (f"  ({c['setup']})" if c.get("setup") else "")
+    if c.get("error"):
+        return f"error: {c['error'][:200]}"
+    if c.get("tools"):
+        return f"ready, {c['tools']} tools" + (" (deferred: loaded with tool_search)" if c.get("deferred") else "")
+    return "ready, not listed yet (`edgent connectors test " + str(c["name"]) + "`)"
+
+
+def _parse_pairs(items: list[str] | None, what: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise ConfigurationError(f"{what} must look like NAME=value; got {item!r}")
+        out[key.strip()] = value
+    return out
+
+
+def cmd_connectors(args: argparse.Namespace) -> int:
+    from ..application.connectors import PRESETS, add_connector, looks_like_secret, remove_connector, settings_path
+
+    action = getattr(args, "connectors_cmd", None) or "list"
+    if action == "presets":
+        for p in PRESETS.values():
+            print(f"{p.name:11s} {p.summary}\n            variants: {', '.join(p.variants)} (default {p.default_variant})\n            setup: {p.setup}\n            docs: {p.docs}")
+        return 0
+    app = _app(args)
+    manager = app.connectors
+    if action == "list":
+        rows = manager.status()
+        if getattr(args, "json", False):
+            print(json.dumps(rows, indent=2, default=str))
+            return 0
+        if not rows:
+            print("no connectors configured. Presets: " + ", ".join(PRESETS) + ". Add one with `edgent connectors add <preset>`.")
+            return 0
+        for c in rows:
+            where = c.get("url") or c.get("command") or ""
+            print(f"{c['name']:12s} {(c.get('preset') or 'custom'):10s} {c.get('transport', ''):5s} {_connector_state(c)}\n             {where}")
+        return 0
+    if action == "add":
+        name = args.name.strip().lower()
+        entry: dict[str, Any] = {}
+        if name in PRESETS or args.preset:
+            entry["preset"] = args.preset or name
+        if args.variant:
+            entry["variant"] = args.variant
+        if args.url:
+            entry["url"] = args.url
+        extra = list(args.command_args or [])
+        if extra[:1] == ["--"]:
+            extra = extra[1:]
+        if extra and not args.command:
+            print("arguments after -- belong to --command; give --command too", file=sys.stderr)
+            return 2
+        if args.command:
+            entry["command"] = args.command
+            entry["args"] = [*(args.arg or []), *extra]
+        headers, env = _parse_pairs(args.header, "--header"), _parse_pairs(args.env, "--env")
+        for label, pairs in (("header", headers), ("env", env)):
+            for k, v in pairs.items():
+                if looks_like_secret(v):
+                    print(f"warning: --{label} {k} looks like a literal key; it is written to settings in plain text. Prefer {k}=${{MY_KEY}} and export MY_KEY.", file=sys.stderr)
+        if headers:
+            entry["headers"] = headers
+        if env:
+            entry["env"] = env
+        if args.expose:
+            entry["expose"] = args.expose
+        if not entry.get("preset") and not entry.get("url") and not entry.get("command"):
+            print(f"{name!r} is not a preset ({', '.join(PRESETS)}); give --url for a remote server or --command for a local one", file=sys.stderr)
+            return 2
+        path = settings_path(app.workspace, args.scope, app.home)
+        add_connector(path, name, entry, allow=args.allow)
+        print(f"added connector {name} to {path}" + (f" and allowed mcp__{name} without asking" if args.allow else ""))
+        from ..application.app import App
+
+        app = App(app.workspace, app.config, provider=app.provider)  # re-read settings with the new entry
+        cfg = next((c for c in app.connectors.configs() if c.name == name), None)
+        if cfg is None or not cfg.ready:
+            state = app.connectors.status_of(app.connectors.get(name)) if cfg is not None else {"name": name, "problem": "not loaded"}
+            print(f"  {_connector_state(state)}")
+            return 0 if cfg is not None and not cfg.problem else 2
+        if args.no_test:
+            return 0
+        return _connector_test(app, name)
+    if action == "remove":
+        removed = remove_connector(settings_path(app.workspace, args.scope, app.home), args.name)
+        print(f"removed connector {args.name}" if removed else f"no connector {args.name} in the {args.scope} settings", file=sys.stdout if removed else sys.stderr)
+        return 0 if removed else 1
+    if action == "test":
+        return _connector_test(app, args.name)
+    if action == "refresh":
+        results = manager.ensure(refresh=True, names=[args.name] if args.name else None, timeout_s=args.timeout)
+        for name, outcome in sorted(results.items()):
+            print(f"{name:12s} {outcome}")
+        return 0 if all(not o.startswith("error") for o in results.values()) else 1
+    if action == "tools":
+        names = manager.tool_names(args.name)
+        if not names:
+            print(f"no tools registered for {args.name}; run `edgent connectors test {args.name}`", file=sys.stderr)
+            return 1
+        for n in names:
+            spec = app.registry.get(n)
+            first = (spec.description.split("] ", 1)[-1] if spec else "").split(". ")[0][:110]
+            print(f"{n:52s} {spec.permission if spec else '':8s} {'deferred' if getattr(spec, 'deferred', False) else '        '} {first}")
+        return 0
+    return 2
+
+
+def _connector_test(app: Any, name: str) -> int:
+    from ..domain.errors import ToolFailure
+
+    print(f"connecting to {name}...", file=sys.stderr)
+    try:
+        report = app.connectors.test(name)
+    except ToolFailure as e:
+        err = e.error
+        print(f"{name}: {err.message}" + (f"\n  {err.remediation}" if err.remediation else ""), file=sys.stderr)
+        return 1
+    server = report.get("server") or {}
+    info = server.get("server_info") or {}
+    print(f"{name}: connected to {info.get('name', '?')} {info.get('version', '')} over {report.get('transport')} (MCP {server.get('protocol_version')}, {server.get('era')} era)")
+    tools = report.get("tools") or []
+    print(f"  {len(tools)} tools{' (deferred: the model loads them with tool_search)' if report.get('deferred') else ''}: {', '.join(tools[:40])}{' ...' if len(tools) > 40 else ''}")
     return 0
 
 
@@ -516,6 +653,36 @@ def build_parser() -> argparse.ArgumentParser:
     add("walkthrough", "the unknowns ledger as Markdown", cmd_walkthrough)
     p = add("skills", "list the skills (or agents) visible to this workspace", cmd_skills)
     p.add_argument("kind", nargs="?", choices=["skills", "agents"], default="skills")
+
+    p = add("connectors", "MCP connectors: Perplexity, Playwright, Firecrawl, PostHog, Composio or any MCP server", cmd_connectors)
+    cp = p.add_subparsers(dest="connectors_cmd")
+    c = cp.add_parser("list", help="configured connectors and their state")
+    c.add_argument("--json", action="store_true")
+    cp.add_parser("presets", help="the connectors that ship with Edgent and what each needs")
+    c = cp.add_parser("add", help="add a preset (perplexity, playwright, firecrawl, posthog, composio) or a custom MCP server")
+    c.add_argument("name")
+    c.add_argument("--preset", help="use a preset under another name")
+    c.add_argument("--variant", help="preset variant, e.g. remote or local (see `edgent connectors presets`)")
+    c.add_argument("--url", help="a remote MCP endpoint (Streamable HTTP)")
+    c.add_argument("--command", help="a local MCP server command, e.g. npx")
+    c.add_argument("--arg", action="append", help="an argument for --command (repeatable; write --arg=-y for one that starts with a dash)")
+    c.add_argument("--header", action="append", metavar="NAME=VALUE", help="an HTTP header; use ${VAR} for keys (repeatable)")
+    c.add_argument("--env", action="append", metavar="NAME=VALUE", help="an environment variable for a local server; use ${VAR} for keys (repeatable)")
+    c.add_argument("--expose", choices=["auto", "all", "deferred"], help="send every schema, or load them on demand with tool_search")
+    c.add_argument("--scope", choices=["workspace", "user"], default="workspace", help="write to .edgent/settings.json or ~/.edgent/settings.json")
+    c.add_argument("--allow", action="store_true", help="also allow this connector's tools without asking (permissions.allow)")
+    c.add_argument("--no-test", action="store_true", help="do not connect and list the tools now")
+    c.add_argument("command_args", nargs="*", help="after --: the arguments of --command, e.g. -- -y some-mcp-server")
+    c = cp.add_parser("remove", help="remove a connector from the settings")
+    c.add_argument("name")
+    c.add_argument("--scope", choices=["workspace", "user"], default="workspace")
+    c = cp.add_parser("test", help="connect, list the tools and refresh the cache")
+    c.add_argument("name")
+    c = cp.add_parser("tools", help="the tools a connector contributes")
+    c.add_argument("name")
+    c = cp.add_parser("refresh", help="re-list the tools of every connector (or one)")
+    c.add_argument("name", nargs="?")
+    c.add_argument("--timeout", type=float, default=180.0, help="seconds to wait for all of them")
 
     p = add("doctor", "toolchains, provider, workspace, host registration", cmd_doctor)
     p.add_argument("--host", choices=HOSTS)

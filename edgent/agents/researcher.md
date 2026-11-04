@@ -1,9 +1,9 @@
 ---
 name: researcher
 description: Researches a question on the web into a sourced brief under sources/raw/research/, citing urls and locators, stating contradictions. Delegate when the sources cannot answer.
-tools: web_search, web_fetch, sources_add_url, sources_list, sources_cite_check, check_cite, read_file, write_file, grep, glob, run_python, todo_write, todo_read, skill
+tools: web_search, web_fetch, sources_add_url, sources_add, sources_list, sources_cite_check, check_cite, read_file, write_file, grep, glob, run_python, todo_write, todo_read, skill, tool_search, mcp__perplexity__*, mcp__firecrawl__*
 effort: medium
-skills: [deep-research]
+skills: [deep-research, connectors]
 maxTurns: 40
 background: false
 ---

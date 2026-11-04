@@ -19,6 +19,10 @@ so the model gets the list of available tools in the remediation.
 needs the loop (``agent``), a person (``ask_user``) or Edgent's own session
 (``todo_*``, ``session_recall``, ``remember``) is left out when the context
 has no ``spawn``, ``ask_user`` or ``session`` (``HOST_CONTEXT_TOOLS``).
+``tool_search`` is never advertised (hosts defer tools themselves), and a tool
+whose origin is a connector (``connector:<server>``) is neither advertised nor
+callable: Edgent never re-exports a third party's tools to a host, which can
+connect to that server directly.
 
 Permissions: a stdio server has no prompt of its own, and the host asks its
 user before every ``tools/call`` it forwards. So when the tool context has
@@ -38,10 +42,10 @@ from collections.abc import Callable, Iterable
 from typing import Any, TextIO
 
 from .. import __version__
-from ..domain.errors import ConfigurationError, ErrorCategory, Limit
+from ..domain.errors import ConfigurationError, ErrorCategory, HarnessError, Limit
 from ..domain.types import ContentPart
 from .mcp_prompts import PromptDef, PromptError, _as_list, get_prompt, list_prompts
-from .registry import ToolContext, ToolRegistry, ToolResult, ToolSpec
+from .registry import TOOL_SEARCH_NAME, ToolContext, ToolRegistry, ToolResult, ToolSpec
 
 PROTOCOL_VERSION = "2025-06-18"
 TOOLS_PAGE_SIZE_ITEMS = 50  # tools per tools/list page (count); a nextCursor continues
@@ -63,6 +67,8 @@ HOST_CONTEXT_TOOLS: dict[str, str] = {
     "session_recall": "session",
     "remember": "session",
 }
+HOST_HIDDEN_TOOLS: frozenset[str] = frozenset({TOOL_SEARCH_NAME})  # the host has its own tool deferral
+CONNECTOR_ORIGIN_PREFIX = "connector:"
 
 # JSON-RPC 2.0 error codes.
 PARSE_ERROR = -32700
@@ -152,6 +158,10 @@ def _media_block(att: ContentPart) -> dict[str, Any]:
         return {"type": "text", "text": f"{stand_in} (not inlined: {e.__class__.__name__}: {e})"}
     mime = att.mime or ("image/png" if att.type == "image" else "audio/wav")
     return {"type": att.type, "data": data, "mimeType": mime}
+
+
+def is_connector_tool(spec: ToolSpec | None) -> bool:
+    return spec is not None and spec.origin.startswith(CONNECTOR_ORIGIN_PREFIX)
 
 
 def tool_result_to_mcp(result: ToolResult) -> dict[str, Any]:
@@ -298,10 +308,11 @@ class MCPServer:
         return {}
 
     def advertised_tool_names(self, ctx: ToolContext | None = None) -> list[str]:
-        """The registry's tools minus those whose precondition (spawn, an interactive user, a session) ``ctx`` cannot meet."""
+        """The registry's tools minus those whose precondition (spawn, an interactive user, a session) ``ctx`` cannot meet,
+        ``tool_search``, and every connector tool (a third party's tool is the host's to connect, not Edgent's to re-export)."""
         ctx = self.ctx_factory() if ctx is None else ctx
-        hidden = {name for name, attr in HOST_CONTEXT_TOOLS.items() if getattr(ctx, attr, None) is None}
-        return [n for n in self.registry.names() if n not in hidden]
+        hidden = {name for name, attr in HOST_CONTEXT_TOOLS.items() if getattr(ctx, attr, None) is None} | HOST_HIDDEN_TOOLS
+        return [n for n in self.registry.names() if n not in hidden and not is_connector_tool(self.registry.get(n))]
 
     def _tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
         tools = self.registry.mcp_manifest(compact=self.schema_profile != "full", allowlist=set(self.advertised_tool_names()))["tools"]
@@ -330,6 +341,15 @@ class MCPServer:
         arguments = params.get("arguments")
         if arguments is None:
             arguments = {}
+        spec = self.registry.get(name)
+        if spec is not None and is_connector_tool(spec):
+            error = HarnessError(
+                "permission_denied",
+                f"tool {name!r} comes from a connector ({spec.origin}); Edgent does not re-export third-party tools to an MCP host",
+                ErrorCategory.permission_denied,
+                remediation="Connect the host to that MCP server directly, or use a tool from tools/list.",
+            )
+            return tool_result_to_mcp(ToolResult(self.registry.ids.new("call"), name, False, None, error))
         ctx = self.ctx_factory()
         if ctx.ask_permission is None:
             ctx.ask_permission = self.ask_permission
@@ -416,8 +436,10 @@ class MCPServer:
 
 
 __all__ = [
+    "CONNECTOR_ORIGIN_PREFIX",
     "DEFAULT_INSTRUCTIONS",
     "HOST_CONTEXT_TOOLS",
+    "HOST_HIDDEN_TOOLS",
     "INTERNAL_ERROR",
     "INVALID_PARAMS",
     "INVALID_REQUEST",
@@ -431,6 +453,7 @@ __all__ = [
     "MCPServer",
     "RpcError",
     "host_grants_permission",
+    "is_connector_tool",
     "resolve_schema_profile",
     "tool_result_to_mcp",
 ]
