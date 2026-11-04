@@ -36,15 +36,17 @@ from ..adapters.mcp_client import ClientOptions, HttpSpec, McpClient, McpError, 
 from ..domain.errors import ConfigurationError, ErrorCategory, ToolFailure
 from ..domain.utils import canonical_json, ensure_dir, now_iso, read_json, sha256_text, write_json
 
-CONNECTOR_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+CONNECTOR_NAME_RE = re.compile(r"^[a-z](?:[a-z0-9]|[_-](?=[a-z0-9])){0,31}$")  # no "__" (the name separator) and no trailing "_" or "-"
 TOOL_NAME_MAX_CHARS = 64  # the strictest provider limit on a function name (chars; OpenAI and Gemini)
 DESCRIPTION_MAX_CHARS = 1200  # a connector tool description shown to the model (chars)
+TITLE_MAX_CHARS = 120  # a connector tool title prefixed to that description (chars)
 SCHEMA_MAX_CHARS = 12_000  # a connector tool's parameter schema; deeper parts are elided beyond this (chars)
 DEFER_OVER_TOOLS = 8  # a connector with more tools than this is deferred unless expose says otherwise (tools)
 CONNECTOR_TIMEOUT_S = 120.0  # default per call (s)
 TIMEOUT_MARGIN_S = 15.0  # the registry's own timeout sits above the client's so the client reports first (s)
 CONNECT_ALL_TIMEOUT_S = 90.0  # listing every uncached connector before the first model call (s)
 CACHE_TTL_S = 7 * 24 * 3600.0  # tool lists are re-listed after this (s) or when the configuration changes
+LIST_RETRY_AFTER_S = 300.0  # a connector whose listing failed is tried again after this, in a long-running process (s)
 INLINE_OUTPUT_CHARS = 12_000  # a connector result kept inline before the registry persists it (chars)
 TEXT_RESULT_MAX_CHARS = 400_000  # text kept from one result before it is cut (chars)
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # one image, audio clip or blob saved from a result (bytes)
@@ -196,7 +198,7 @@ class ConnectorConfig:
         out: dict[str, Any] = {"name": self.name, "preset": self.preset.name if self.preset else None, "variant": self.variant or None,
                                "enabled": self.enabled, "transport": self.transport, "ready": self.ready}
         if isinstance(self.spec, HttpSpec):
-            out["url"] = redact_url(self.spec.url)
+            out["url"] = redact(redact_url(self.spec.url), self.secrets)
             out["headers"] = sorted(self.spec.headers)
         elif isinstance(self.spec, StdioSpec):
             out["command"] = redact(self.spec.describe(), self.secrets)
@@ -248,7 +250,7 @@ def resolve(name: str, raw: dict[str, Any], environ: dict[str, str], workspace_r
     cfg = ConnectorConfig(name=name, raw=dict(raw), source=source)
     try:
         if not CONNECTOR_NAME_RE.match(name):
-            raise ConfigurationError(f"connector name {name!r} must be lower-case letters, digits, '-' or '_', starting with a letter (at most 32)")
+            raise ConfigurationError(f"connector name {name!r} must be lower-case letters and digits, with single '-' or '_' between them, starting with a letter (at most 32)")
         cfg.enabled = bool(raw.get("enabled", True))
         preset_name = raw.get("preset", name if name in PRESETS and not ({"url", "command", "serverUrl"} & set(raw)) else None)
         body: dict[str, Any] = {}
@@ -393,12 +395,52 @@ def _defaults_optional(schema: Any) -> Any:
     return schema
 
 
-def _elide(schema: Any, depth: int) -> Any:
-    if not isinstance(schema, dict):
-        return schema
+SCHEMA_PASSES = ((400, 100, 8), (160, 40, 5), (60, 12, 3), (0, 0, 2))  # (description chars, enum values, schema depth) per pass
+NESTED_KEYS = ("items", "additionalProperties", "not", "contains", "propertyNames", "if", "then", "else")
+LIST_KEYS = ("anyOf", "oneOf", "allOf", "prefixItems")
+
+
+def _shrink(node: Any, desc_cap: int, enum_cap: int, depth: int) -> Any:
+    """One schema node made smaller without making a valid call invalid: descriptions cut, long enums relaxed to a
+    sample in the description, and below ``depth`` a nested schema kept only as its type (nothing required of it)."""
+    if not isinstance(node, dict):
+        return node
     if depth <= 0:
-        return {k: schema[k] for k in ("type", "description", "enum") if k in schema}
-    return {k: (_elide(v, depth - 1) if isinstance(v, dict) else [_elide(x, depth - 1) for x in v] if isinstance(v, list) else v) for k, v in schema.items()}
+        return {k: node[k] for k in ("type",) if k in node}
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key in ("examples", "title", "$comment"):
+            continue
+        if key == "description":
+            if desc_cap and isinstance(value, str):
+                out[key] = value if len(value) <= desc_cap else value[: desc_cap - 1] + "…"
+            continue
+        if key == "enum" and isinstance(value, list) and (not enum_cap or len(value) > enum_cap):
+            if enum_cap:
+                sample = ", ".join(json.dumps(v) for v in value[:enum_cap])
+                base = str(node.get("description") or "")[:desc_cap] if desc_cap else ""
+                out["description"] = (base + f" One of {len(value)} values, e.g. {sample}.").strip()
+            continue  # the server still validates the value; the model sees a sample
+        if key in ("properties", "patternProperties", "$defs", "definitions") and isinstance(value, dict):
+            out[key] = {k: _shrink(v, desc_cap, enum_cap, depth - 1) for k, v in value.items()}
+        elif key in NESTED_KEYS and isinstance(value, dict):
+            out[key] = _shrink(value, desc_cap, enum_cap, depth - 1)
+        elif key in LIST_KEYS and isinstance(value, list):
+            out[key] = [_shrink(v, desc_cap, enum_cap, depth - 1) for v in value]
+        else:
+            out[key] = value
+    if isinstance(out.get("properties"), dict) and isinstance(out.get("required"), list):
+        out["required"] = [r for r in out["required"] if r in out["properties"]]
+    return out
+
+
+def _skeleton(schema: dict[str, Any]) -> dict[str, Any]:
+    """The last resort for a huge schema: every top-level parameter with its type only, so no valid call is refused."""
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    out: dict[str, Any] = {"type": "object", "properties": {k: ({"type": v["type"]} if isinstance(v, dict) and "type" in v else {}) for k, v in props.items()}}
+    if isinstance(schema.get("required"), list):
+        out["required"] = [r for r in schema["required"] if r in out["properties"]]
+    return out
 
 
 def normalise_schema(schema: Any) -> dict[str, Any]:
@@ -410,11 +452,16 @@ def normalise_schema(schema: Any) -> dict[str, Any]:
     if out.get("type") != "object":
         out = {"type": "object", "properties": out.get("properties") or {}, **({"required": out["required"]} if isinstance(out.get("required"), list) else {})}
     out.setdefault("properties", {})
-    for depth in (6, 4, 2, 1):
-        if len(json.dumps(out)) <= SCHEMA_MAX_CHARS:
-            break
-        out = _elide(out, depth)
-    return out
+    if len(json.dumps(out)) <= SCHEMA_MAX_CHARS:
+        return out
+    for desc_cap, enum_cap, depth in SCHEMA_PASSES:
+        smaller = _shrink(out, desc_cap, enum_cap, depth)
+        if len(json.dumps(smaller)) <= SCHEMA_MAX_CHARS:
+            return smaller
+    smaller = _skeleton(out)
+    if len(json.dumps(smaller)) <= SCHEMA_MAX_CHARS:
+        return smaller
+    return {"type": "object", "description": f"{len(out.get('properties') or {})} parameters; the full schema is too large to show. Pass what the task needs."}
 
 
 def _collapse(text: str) -> str:
@@ -512,6 +559,12 @@ def convert_result(result: dict[str, Any], connector: str, tool: str, workspace:
     return out
 
 
+def _failure(e: McpError, cfg: ConnectorConfig, **details: Any) -> ToolFailure:
+    """An McpError as the tool's typed error, with every expanded secret of the connector masked."""
+    extra = {"rpc_code": e.rpc_code} if e.rpc_code is not None else {}
+    return ToolFailure(e.code, redact(e.message, cfg.secrets), e.category, retryable=e.retryable, remediation=redact(e.remediation, cfg.secrets), **extra, **details)
+
+
 # --------------------------------------------------------------------------- the manager
 @dataclass
 class ConnectorState:
@@ -523,6 +576,8 @@ class ConnectorState:
     server: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     stale: bool = False  # the server announced a new tool list; re-listed before the next loop starts
+    failed_at: float = 0.0  # when the last listing failed; retried after LIST_RETRY_AFTER_S
+    warnings: list[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -575,14 +630,19 @@ class ConnectorManager:
 
     # -- cache
     def _cache_path(self, name: str) -> Path:
-        return Path(ensure_dir(self.workspace.path("cache") / CACHE_DIR)) / f"{name}.json"
+        """Tool lists (with the annotations that decide permissions) live in the user's home, outside the workspace the
+        model can write to; one folder per workspace."""
+        home = Path(self.home) if self.home else Path(os.environ.get("EDGENT_HOME", Path.home() / ".edgent"))
+        key = sha256_text(str(Path(self.workspace.root).resolve()))[:16]
+        return Path(ensure_dir(home / "cache" / CACHE_DIR / key)) / f"{name}.json"
 
     def _load_cache(self, state: ConnectorState) -> bool:
         data = read_json(self._cache_path(state.config.name), None)
         if not isinstance(data, dict) or data.get("fingerprint") != state.config.fingerprint():
             return False
         ttl = float(data.get("ttl_s") or CACHE_TTL_S)
-        if time.time() - float(data.get("fetched_at") or 0) > min(ttl, CACHE_TTL_S):
+        age = time.time() - float(data.get("fetched_at") or 0)
+        if age < -60 or age > min(ttl, CACHE_TTL_S):  # a timestamp from the future is not believed
             return False
         state.tools = [t for t in data.get("tools") or [] if isinstance(t, dict)]
         state.server = data.get("server") if isinstance(data.get("server"), dict) else {}
@@ -607,8 +667,10 @@ class ConnectorManager:
 
     def ensure(self, timeout_s: float = CONNECT_ALL_TIMEOUT_S, refresh: bool = False, names: list[str] | None = None) -> dict[str, str]:
         """List the tools of ready connectors that have no fresh cache (all of them with ``refresh``), in parallel."""
+        now = time.time()
         todo = [s for s in self._states.values() if s.config.ready and (names is None or s.config.name in names)
-                and (refresh or s.stale or not (s.tools or self._load_cache(s)))]
+                and (refresh or s.stale or not (s.tools or self._load_cache(s)))
+                and (refresh or names is not None or not s.failed_at or now - s.failed_at >= LIST_RETRY_AFTER_S)]
         results: dict[str, str] = {}
         if todo:
             pool = ThreadPoolExecutor(max_workers=min(4, len(todo)), thread_name_prefix="connector-list")
@@ -620,24 +682,29 @@ class ConnectorManager:
                 except Exception as e:  # noqa: BLE001 - one connector failing never stops the others
                     msg = str(e) or f"no tool list within {timeout_s:g} s (still starting; `edgent connectors test {state.config.name}` waits longer)"
                     state.error = redact(msg, state.config.secrets)
+                    state.failed_at = time.time()
                     results[state.config.name] = f"error: {state.error}"
             pool.shutdown(wait=False, cancel_futures=True)  # a slow starter finishes in the background and registers itself
         self._ensured = True
         return results
 
     def ensure_once(self) -> None:
-        """Before a loop's first request: list what has never been listed, and what a server said changed."""
-        if not self._ensured or any(s.stale for s in self._states.values()):
+        """Before a loop's request: list what has never been listed, what a server said changed, and (after a pause)
+        what failed last time. Cheap when there is nothing to do."""
+        now = time.time()
+        if (not self._ensured or any(s.stale for s in self._states.values())
+                or any(s.failed_at and not s.names and now - s.failed_at >= LIST_RETRY_AFTER_S for s in self._states.values())):
             self.ensure()
 
     def _list(self, state: ConnectorState) -> str:
         client = self._client(state)
         tools = client.list_tools()
         state.tools = self._filter(state.config, tools)
-        state.server = {k: v for k, v in client.describe().items() if k in ("era", "protocol_version", "server_info")}
+        state.server = {k: v for k, v in client.describe().items() if k in ("era", "protocol_version", "server_info", "tools_partial")}
         state.server["instructions"] = (client.instructions or "")[:2000]
         state.fetched_at = time.time()
         state.error = ""
+        state.failed_at = 0.0
         state.stale = False
         self._save_cache(state, client.tools_ttl_s)
         if self._registry is not None:
@@ -669,16 +736,21 @@ class ConnectorManager:
         for old in list(state.names):
             reg.unregister(old)
         state.names = {}
+        state.warnings = []
         deferred = cfg.expose == "deferred" or (cfg.expose == "auto" and len(state.tools) > DEFER_OVER_TOOLS)
         out = []
         for tool in state.tools:
             remote = str(tool["name"])
             name = edgent_tool_name(cfg.name, remote)
-            if reg.get(name) is not None:
-                continue  # a clash after shortening; the first wins
+            if reg.get(name) is not None:  # two remote names map to one Edgent name ('a.b' and 'a_b')
+                name = f"{name[: TOOL_NAME_MAX_CHARS - 7]}_{sha256_text(remote)[:6]}"
+                state.warnings.append(f"tool {remote!r} is registered as {name} (its plain name was taken)")
+                if reg.get(name) is not None:
+                    state.warnings.append(f"tool {remote!r} was skipped: its name collides")
+                    continue
             permission, read_only = permission_for(tool, cfg)
             ann = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else {}
-            title = _collapse(str(tool.get("title") or ann.get("title") or ""))
+            title = _collapse(str(tool.get("title") or ann.get("title") or ""))[:TITLE_MAX_CHARS]
             desc = _collapse(str(tool.get("description") or ""))[:DESCRIPTION_MAX_CHARS]
             description = f"[{cfg.title} connector{': ' + title if title else ''}] {desc or remote} {UNTRUSTED_NOTE}"
             timeout = float(cfg.tool_timeouts.get(remote, cfg.timeout_s))
@@ -719,7 +791,7 @@ class ConnectorManager:
             try:
                 state.client.connect()
             except McpError as e:
-                state.error = e.message
+                state.error = redact(e.message, cfg.secrets)
                 raise
             self._emit({"type": "connector", "name": cfg.name, "event": "connected", "era": state.client.era, "version": state.client.protocol_version})
             return state.client
@@ -740,7 +812,7 @@ class ConnectorManager:
             result = client.call_tool(tool, args, timeout_s)
         except McpError as e:
             self._trace(ctx, connector, tool, False, time.monotonic() - t0, e.code)
-            raise e.to_failure(connector=connector, tool=tool) from None
+            raise _failure(e, state.config, connector=connector, tool=tool) from None
         out = convert_result(result, connector, tool, self.workspace, f"{int(time.time() * 1000)}{os.urandom(2).hex()}")
         self._trace(ctx, connector, tool, True, time.monotonic() - t0, "")
         if client.tools_changed:  # re-listed before the next loop, never while a request may be reading the registry
@@ -771,7 +843,8 @@ class ConnectorManager:
         try:
             self._list(state)
         except McpError as e:
-            raise e.to_failure(connector=name) from None
+            state.error = redact(e.message, state.config.secrets)
+            raise _failure(e, state.config, connector=name) from None
         return {**self.status_of(state), "tools": [str(t.get("name")) for t in state.tools]}
 
     def status_of(self, state: ConnectorState) -> dict[str, Any]:
@@ -785,7 +858,11 @@ class ConnectorManager:
         if state.server:
             out["server"] = {k: v for k, v in state.server.items() if k != "instructions"}
         if state.error:
-            out["error"] = state.error
+            out["error"] = redact(state.error, cfg.secrets)
+        if state.warnings:
+            out["warnings"] = list(state.warnings)
+        if state.server.get("tools_partial"):
+            out.setdefault("warnings", []).append(f"tool list incomplete: {state.server['tools_partial']}")
         if cfg.preset and (cfg.missing or not cfg.ready):
             out["setup"] = cfg.preset.setup
         return out

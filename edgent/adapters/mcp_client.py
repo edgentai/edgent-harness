@@ -20,9 +20,11 @@ The caller (``application.connectors``) decides what the model may see and what 
 from __future__ import annotations
 
 import base64
+import http.client
 import itertools
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -54,6 +56,12 @@ STDERR_TAIL_LINES = 200  # server stderr lines kept for error messages (lines)
 ERROR_TAIL_CHARS = 1500  # stderr shown in an error message (chars)
 DELETE_TIMEOUT_S = 5.0  # ending an HTTP session on close (s)
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+CANCEL_TIMEOUT_S = 5.0  # posting notifications/cancelled for an abandoned HTTP request (s)
+SSE_RESUMES_MAX = 5  # reconnections with Last-Event-ID after a legacy server closes a stream early (count)
+SSE_DEFAULT_RETRY_MS = 1000  # wait before reconnecting when the server sent no retry field (ms)
+SSE_RETRY_CAP_S = 10.0  # the longest wait a server's retry field can impose (s)
+STDERR_LINE_MAX_BYTES = 8192  # one stderr line kept (bytes); the rest of a longer line is dropped
+READ_BUFFER_BYTES = 64 * 1024  # buffered pipe reads instead of one syscall per byte (bytes)
 
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
@@ -168,6 +176,11 @@ def file_uri(path: str) -> str:
     return Path(path).resolve().as_uri()
 
 
+def _valid_id(value: Any) -> bool:
+    """JSON-RPC ids are strings or numbers; anything else cannot key a pending request."""
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
 def _rpc_error(err: Any, secrets: list[str]) -> McpError:
     if not isinstance(err, dict):
         return McpError("protocol_error", f"malformed JSON-RPC error: {str(err)[:200]}", ErrorCategory.execution_failure)
@@ -208,6 +221,7 @@ class StdioTransport:
         self._write_lock = threading.Lock()
         self._stderr: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
         self._closed = False
+        self._reader_done = threading.Event()  # set when the stdout reader stops for any reason
         self.exit_code: int | None = None
 
     # -- lifecycle
@@ -222,11 +236,12 @@ class StdioTransport:
             self._proc = subprocess.Popen(  # noqa: S603 - the command comes from the user's connector settings
                 [exe, *self.spec.args],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                cwd=self.spec.cwd or None, env=env, bufsize=0,
+                cwd=self.spec.cwd or None, env=env, bufsize=READ_BUFFER_BYTES,  # buffered: readline must not cost a syscall per byte
                 start_new_session=os.name == "posix",  # npx spawns node: the whole group is stopped on close
             )
         except OSError as e:
             raise McpError("unavailable", f"could not start {self.spec.command!r}: {e}", ErrorCategory.unavailable, "Check the connector's command and arguments.") from e
+        self._reader_done.clear()
         threading.Thread(target=self._read_stdout, name="mcp-stdio-out", daemon=True).start()
         threading.Thread(target=self._read_stderr, name="mcp-stdio-err", daemon=True).start()
 
@@ -264,13 +279,21 @@ class StdioTransport:
 
     @property
     def alive(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None and not self._closed
+        return self._proc is not None and self._proc.poll() is None and not self._closed and not self._reader_done.is_set()
 
     def stderr_tail(self, chars: int = ERROR_TAIL_CHARS) -> str:
         return redact("\n".join(self._stderr), self.options.secrets)[-chars:]
 
     # -- reading
     def _read_stdout(self) -> None:
+        try:
+            self._read_stdout_loop()
+        finally:  # whatever ended the loop, nobody keeps waiting on this transport
+            self._reader_done.set()
+            self.exit_code = self._proc.poll() if self._proc is not None else None
+            self._fail_pending("the connector process stopped answering" + (f" (exit code {self.exit_code})" if self.exit_code is not None else ""))
+
+    def _read_stdout_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         out = self._proc.stdout
         while True:
@@ -284,6 +307,7 @@ class StdioTransport:
                 self._stderr.append(f"[edgent] dropped a stdout message over {MAX_MESSAGE_BYTES} bytes")
                 while (rest := out.readline(MAX_MESSAGE_BYTES)) and not rest.endswith(b"\n"):
                     pass
+                self._fail_pending(f"the connector sent a message over {MAX_MESSAGE_BYTES} bytes, which Edgent does not read", code="truncated")
                 continue
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
@@ -299,18 +323,32 @@ class StdioTransport:
                 continue
             for m in msg if isinstance(msg, list) else [msg]:
                 if isinstance(m, dict):
-                    self._dispatch(m)
-        self.exit_code = self._proc.poll()
-        self._fail_pending("the connector process exited" + (f" with code {self.exit_code}" if self.exit_code is not None else ""))
+                    try:
+                        self._dispatch(m)
+                    except Exception as e:  # noqa: BLE001 - one malformed message never stops the reader
+                        self._stderr.append(f"[edgent] ignored a malformed message: {type(e).__name__}: {str(e)[:200]}")
 
     def _read_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
-        for raw in iter(self._proc.stderr.readline, b""):
+        err = self._proc.stderr
+        while True:
+            try:
+                raw = err.readline(STDERR_LINE_MAX_BYTES)
+            except (OSError, ValueError):
+                break
+            if not raw:
+                break
+            if not raw.endswith(b"\n"):  # an over-long line (a progress bar): keep its start, drop the rest
+                while (rest := err.readline(STDERR_LINE_MAX_BYTES)) and not rest.endswith(b"\n"):
+                    pass
             text = raw.decode("utf-8", errors="replace").rstrip()
             if text:
                 self._stderr.append(text[:1000])
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
+        if "id" in msg and not _valid_id(msg["id"]):
+            self._stderr.append(f"[edgent] ignored a message with an invalid id: {str(msg.get('id'))[:80]}")
+            return
         if "method" not in msg and "id" in msg:
             with self._lock:
                 pending = self._pending.pop(msg["id"], None)
@@ -327,11 +365,11 @@ class StdioTransport:
     def _answer(self, msg: dict[str, Any]) -> None:
         self.on_message(msg)
 
-    def _fail_pending(self, reason: str) -> None:
+    def _fail_pending(self, reason: str, code: str = "unavailable") -> None:
         with self._lock:
             waiting, self._pending = list(self._pending.values()), {}
         for p in waiting:
-            p.message = {"_transport_error": reason}
+            p.message = {"_transport_error": reason, "_code": code}
             p.event.set()
 
     def _event(self, kind: str, data: dict[str, Any]) -> None:
@@ -366,21 +404,55 @@ class StdioTransport:
         if not pending.event.wait(timeout_s):
             with self._lock:
                 self._pending.pop(msg["id"], None)
-            try:  # tell the server to stop working on it
-                self.write({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": msg["id"], "reason": f"timed out after {timeout_s:g} s"}})
-            except McpError:
-                pass
+            if msg.get("method") != "initialize":  # the specification forbids cancelling initialize
+                try:  # tell the server to stop working on it
+                    self.write({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": msg["id"], "reason": f"timed out after {timeout_s:g} s"}})
+                except McpError:
+                    pass
             raise McpError("timeout", f"{msg.get('method')} got no answer within {timeout_s:g} s", ErrorCategory.timeout,
                            "Retry once with a narrower request, or raise the connector's timeout_s.", retryable=True)
         assert pending.message is not None
         if "_transport_error" in pending.message:
+            if pending.message.get("_code") == "truncated":
+                raise McpError("truncated", pending.message["_transport_error"], ErrorCategory.resource_constraint, "Ask the tool for less (a smaller page, fewer results).")
             raise self._dead_error(pending.message["_transport_error"])
         return pending.message
 
     def _dead_error(self, reason: str = "the connector process is not running") -> McpError:
         tail = self.stderr_tail()
-        return McpError("unavailable", f"{reason} ({self.spec.describe()})" + (f"; its last output:\n{tail}" if tail else ""),
+        return McpError("unavailable", f"{reason} ({redact(self.spec.describe(), self.options.secrets)})" + (f"; its last output:\n{tail}" if tail else ""),
                         ErrorCategory.unavailable, "Run `edgent connectors test <name>` to see why it stopped; check its key and command.", retryable=True)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """An MCP endpoint never redirects a POST. Following one would re-send the API key headers to whatever host the
+    Location names (urllib copies them), so a redirect is reported instead of followed."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        raise _Redirected(code, newurl)
+
+
+class _Redirected(Exception):
+    def __init__(self, code: int, location: str) -> None:
+        super().__init__(location)
+        self.code = code
+        self.location = location
+
+
+def _opener(url: str) -> Callable[..., Any]:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    handlers: list[Any] = [_NoRedirect()]
+    if host in LOOPBACK_HOSTS or host.endswith(".localhost"):
+        handlers.append(urllib.request.ProxyHandler({}))  # a server on this machine never goes through HTTPS_PROXY
+    return urllib.request.build_opener(*handlers).open
+
+
+def _session_lost(status: int, rpc: dict[str, Any] | None, raw: str) -> bool:
+    """A server that no longer knows the session: 404 per the spec, or the SDK's 400 'No valid session ID provided'."""
+    if status == 404:
+        return True
+    text = (str(rpc.get("message", "")) if rpc else raw).lower()
+    return status == 400 and "session" in text
 
 
 class HttpTransport:
@@ -393,14 +465,14 @@ class HttpTransport:
         self.session_id: str | None = None
         self.protocol_version: str | None = None
         self.modern = False
+        self.tool_schemas: dict[str, dict[str, Any]] = {}  # name -> inputSchema, for modern x-mcp-header mirroring
         self._lock = threading.Lock()
         parts = urllib.parse.urlsplit(spec.url)
         if parts.scheme not in ("http", "https") or not parts.netloc:
             raise McpError("configuration_invalid", f"connector URL must be http(s)://host/path; got {redact_url(spec.url)}",
                            ErrorCategory.configuration_invalid, "Fix the url in the connector settings.")
-        host = (parts.hostname or "").lower()
-        # A server on this machine is never sent through HTTPS_PROXY/HTTP_PROXY, whatever NO_PROXY says
-        self._open = urllib.request.build_opener(urllib.request.ProxyHandler({})).open if host in LOOPBACK_HOSTS or host.endswith(".localhost") else urllib.request.urlopen
+        self.display_url = redact(redact_url(spec.url), options.secrets)  # what any message may show
+        self._open = _opener(spec.url)
 
     @property
     def alive(self) -> bool:
@@ -420,7 +492,7 @@ class HttpTransport:
             try:
                 with self._open(req, timeout=DELETE_TIMEOUT_S):  # noqa: S310 - http(s) checked in __init__
                     pass
-            except (urllib.error.URLError, OSError, ValueError):
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, _Redirected):
                 pass  # 405 (sessions cannot be ended) or the network is gone: nothing to do
 
     def _base_headers(self) -> dict[str, str]:
@@ -428,12 +500,14 @@ class HttpTransport:
         headers.update(self.spec.headers)
         return headers
 
-    def _headers(self, msg: dict[str, Any]) -> dict[str, str]:
+    def _headers(self, msg: dict[str, Any]) -> tuple[dict[str, str], str | None]:
+        """The request headers and the session id they carry (an expired session is recognised by the id that failed)."""
         headers = self._base_headers()
         headers.update({"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
         with self._lock:
-            if self.session_id and not self.modern:
-                headers["Mcp-Session-Id"] = self.session_id
+            sid = self.session_id if not self.modern else None
+            if sid:
+                headers["Mcp-Session-Id"] = sid
             if self.protocol_version:
                 headers["MCP-Protocol-Version"] = self.protocol_version
         if self.modern and "method" in msg:
@@ -442,43 +516,47 @@ class HttpTransport:
             name = params.get("name") if msg["method"] in ("tools/call", "prompts/get") else params.get("uri") if msg["method"] == "resources/read" else None
             if isinstance(name, str):
                 headers["Mcp-Name"] = header_value(name)
-        return headers
+            if msg["method"] == "tools/call" and isinstance(name, str):
+                headers.update(_param_headers(self.tool_schemas.get(name), params.get("arguments")))
+        return headers, sid
 
     def write(self, msg: dict[str, Any]) -> None:
         """A notification or a response to a server request: 202 expected, nothing read back."""
-        self._post(msg, timeout_s=self.options.request_timeout_s, expect_response=False)
+        self._post(msg, timeout_s=min(self.options.request_timeout_s, CANCEL_TIMEOUT_S * 4), expect_response=False)
 
     def request(self, msg: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-        result = self._post(msg, timeout_s=timeout_s, expect_response=True)
+        try:
+            result = self._post(msg, timeout_s=timeout_s, expect_response=True)
+        except McpError as e:
+            if e.code in ("timeout", "unavailable") and not self.modern and msg.get("method") != "initialize" and "id" in msg:
+                self._cancel(msg["id"], e.message)  # a legacy server keeps working on a request whose connection dropped
+            raise
         assert result is not None
         return result
 
+    def _cancel(self, request_id: Any, reason: str) -> None:
+        note = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": request_id, "reason": reason[:200]}}
+
+        def send() -> None:
+            try:
+                self._post(note, timeout_s=CANCEL_TIMEOUT_S, expect_response=False)
+            except McpError:
+                pass
+
+        threading.Thread(target=send, name="mcp-http-cancel", daemon=True).start()
+
     def _post(self, msg: dict[str, Any], timeout_s: float, expect_response: bool) -> dict[str, Any] | None:
         body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(self.spec.url, data=body, method="POST", headers=self._headers(msg))
+        headers, sid = self._headers(msg)
+        req = urllib.request.Request(self.spec.url, data=body, method="POST", headers=headers)
         deadline = time.monotonic() + timeout_s
-        try:
-            resp = self._open(req, timeout=timeout_s)  # noqa: S310 - http(s) checked in __init__
-        except urllib.error.HTTPError as e:
-            raise self._http_error(e, msg) from None
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            reason = getattr(e, "reason", e)
-            if isinstance(reason, TimeoutError) or "timed out" in str(reason):
-                raise McpError("timeout", f"{msg.get('method', 'message')} got no answer within {timeout_s:g} s", ErrorCategory.timeout,
-                               "Retry once with a narrower request, or raise the connector's timeout_s.", retryable=True) from None
-            text = redact(str(reason), self.options.secrets)
-            if "Tunnel connection failed" in text:  # urllib's words when HTTPS_PROXY refuses the CONNECT
-                host = urllib.parse.urlsplit(self.spec.url).hostname or "the host"
-                raise McpError("unavailable", f"the HTTPS proxy refused the connection to {host} ({text.split(':', 1)[-1].strip()})",
-                               ErrorCategory.unavailable, f"This network's proxy does not allow {host}; allow it in the network policy or run Edgent where it is reachable.") from None
-            raise McpError("unavailable", f"cannot reach {redact_url(self.spec.url)}: {text}",
-                           ErrorCategory.unavailable, "Check the network, the proxy and the connector URL.", retryable=True) from None
+        resp = self._send(req, msg, timeout_s, sid)
         with resp:
-            if "method" in msg and msg.get("method") == "initialize":
-                sid = resp.headers.get("Mcp-Session-Id")
-                if sid:
+            if msg.get("method") == "initialize":
+                new_sid = resp.headers.get("Mcp-Session-Id")
+                if new_sid:
                     with self._lock:
-                        self.session_id = sid.strip()
+                        self.session_id = new_sid.strip()
             if not expect_response or resp.status == 202:
                 if expect_response:
                     raise McpError("protocol_error", f"{msg.get('method')} was accepted with 202 but no response was sent",
@@ -486,55 +564,123 @@ class HttpTransport:
                 return None
             ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if ctype == "text/event-stream":
-                return self._read_sse(resp, msg, deadline)
-            raw = resp.read(MAX_MESSAGE_BYTES + 1)
+                return self._read_sse(resp, msg, deadline, sid)
+            raw = self._read_body(resp, msg, timeout_s)
         if len(raw) > MAX_MESSAGE_BYTES:
             raise McpError("truncated", f"response over {MAX_MESSAGE_BYTES} bytes", ErrorCategory.resource_constraint, "Ask for less (a smaller page, fewer results).")
         try:
             data = json.loads(raw.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
-            raise McpError("protocol_error", f"response is not JSON: {raw[:200]!r}", ErrorCategory.execution_failure,
+            raise McpError("protocol_error", f"{self.display_url} did not answer with JSON-RPC", ErrorCategory.execution_failure,
                            "Check that the connector URL is the MCP endpoint (it usually ends in /mcp).") from None
         for m in data if isinstance(data, list) else [data]:
             if isinstance(m, dict) and m.get("id") == msg.get("id") and "method" not in m:
                 return m
         raise McpError("protocol_error", "the response did not answer the request", ErrorCategory.execution_failure, "Report it to the server's maintainers.")
 
-    def _read_sse(self, resp: Any, msg: dict[str, Any], deadline: float) -> dict[str, Any]:
+    def _send(self, req: urllib.request.Request, msg: dict[str, Any], timeout_s: float, sid: str | None) -> Any:
+        try:
+            return self._open(req, timeout=timeout_s)  # noqa: S310 - http(s) checked in __init__
+        except _Redirected as r:
+            target = redact(redact_url(r.location), self.options.secrets)
+            raise McpError("configuration_invalid", f"{self.display_url} redirects (HTTP {r.code}) to {target}; Edgent does not follow it, so no key is sent there",
+                           ErrorCategory.configuration_invalid, "Update the connector's url to the address the redirect names, if you trust it.") from None
+        except urllib.error.HTTPError as e:
+            raise self._http_error(e, msg, sid) from None
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+            raise self._network_error(e, msg, timeout_s) from None
+
+    def _network_error(self, e: BaseException, msg: dict[str, Any], timeout_s: float) -> McpError:
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, TimeoutError) or "timed out" in str(reason):
+            return McpError("timeout", f"{msg.get('method', 'message')} got no answer within {timeout_s:g} s", ErrorCategory.timeout,
+                            "Retry once with a narrower request, or raise the connector's timeout_s.", retryable=True)
+        text = redact(str(reason), self.options.secrets)
+        if "Tunnel connection failed" in text:  # urllib's words when HTTPS_PROXY refuses the CONNECT
+            host = urllib.parse.urlsplit(self.spec.url).hostname or "the host"
+            return McpError("unavailable", f"the HTTPS proxy refused the connection to {host} ({text.split(':', 1)[-1].strip()})",
+                            ErrorCategory.unavailable, f"This network's proxy does not allow {host}; allow it in the network policy or run Edgent where it is reachable.")
+        return McpError("unavailable", f"cannot reach {self.display_url}: {text}", ErrorCategory.unavailable, "Check the network, the proxy and the connector URL.", retryable=True)
+
+    def _read_body(self, resp: Any, msg: dict[str, Any], timeout_s: float) -> bytes:
+        try:
+            return resp.read(MAX_MESSAGE_BYTES + 1)
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            if isinstance(e, TimeoutError) or "timed out" in str(e):
+                raise McpError("timeout", f"{msg.get('method')} answer stalled for {timeout_s:g} s", ErrorCategory.timeout,
+                               "Retry once, or raise the connector's timeout_s.", retryable=True) from None
+            raise McpError("unavailable", f"the answer to {msg.get('method')} was cut off: {type(e).__name__}", ErrorCategory.unavailable,
+                           "Retry the call once.", retryable=msg.get("method") != "tools/call") from None
+
+    def _read_sse(self, resp: Any, msg: dict[str, Any], deadline: float, sid: str | None) -> dict[str, Any]:
+        """Read events until the response; a legacy server may close the connection after an event with an id and expect
+        the client to come back with GET and Last-Event-ID (2025-11-25 polling), which is followed within the deadline."""
+        last_id: str | None = None
+        retry_ms = SSE_DEFAULT_RETRY_MS
+        for attempt in range(SSE_RESUMES_MAX + 1):
+            found, last_id, retry_ms = self._consume_stream(resp, msg, deadline, last_id, retry_ms)
+            if found is not None:
+                return found
+            if self.modern or last_id is None or attempt == SSE_RESUMES_MAX:
+                break
+            time.sleep(min(retry_ms / 1000.0, max(0.0, deadline - time.monotonic()), SSE_RETRY_CAP_S))
+            if time.monotonic() >= deadline:
+                break
+            headers = {**self._base_headers(), "Accept": "text/event-stream", "Last-Event-ID": last_id}
+            if sid:
+                headers["Mcp-Session-Id"] = sid
+            if self.protocol_version:
+                headers["MCP-Protocol-Version"] = self.protocol_version
+            resp.close()
+            resp = self._send(urllib.request.Request(self.spec.url, method="GET", headers=headers), msg, max(0.1, deadline - time.monotonic()), sid)
+        side_effects = msg.get("method") == "tools/call"
+        raise McpError("unavailable", f"the stream for {msg.get('method')} closed before the response" + ("; the tool may have run" if side_effects else ""),
+                       ErrorCategory.unavailable, "Check the result in the service before calling again." if side_effects else "Retry once; the server may have dropped the connection.",
+                       retryable=not side_effects)
+
+    def _consume_stream(self, resp: Any, msg: dict[str, Any], deadline: float, last_id: str | None, retry_ms: int) -> tuple[dict[str, Any] | None, str | None, int]:
         data_lines: list[str] = []
         total = 0
-        while True:
-            if time.monotonic() > deadline:
-                raise McpError("timeout", f"{msg.get('method')} stream gave no response in time", ErrorCategory.timeout,
-                               "Retry once, or raise the connector's timeout_s.", retryable=True)
-            try:
-                raw = resp.readline(MAX_MESSAGE_BYTES + 1)
-            except (OSError, ValueError) as e:
-                raise McpError("unavailable", f"the response stream broke: {e}", ErrorCategory.unavailable, "Retry the call once.", retryable=True) from None
-            if not raw:
-                break
-            total += len(raw)
-            if total > MAX_MESSAGE_BYTES:
-                raise McpError("truncated", f"response stream over {MAX_MESSAGE_BYTES} bytes", ErrorCategory.resource_constraint, "Ask for less.")
-            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if line == "":
-                if data_lines:
-                    found = self._sse_event("\n".join(data_lines), msg)
-                    data_lines = []
-                    if found is not None:
-                        return found
-                continue
-            if line.startswith(":"):
-                continue  # a comment or keep-alive
-            name, _, value = line.partition(":")
-            if name == "data":
-                data_lines.append(value[1:] if value.startswith(" ") else value)
+        with resp:
+            while True:
+                if time.monotonic() > deadline:
+                    raise McpError("timeout", f"{msg.get('method')} stream gave no response in time", ErrorCategory.timeout,
+                                   "Retry once, or raise the connector's timeout_s.", retryable=True)
+                try:
+                    raw = resp.readline(MAX_MESSAGE_BYTES + 1)
+                except (OSError, ValueError, http.client.HTTPException) as e:
+                    if isinstance(e, TimeoutError) or "timed out" in str(e):
+                        raise McpError("timeout", f"{msg.get('method')} stream went silent", ErrorCategory.timeout,
+                                       "Retry once, or raise the connector's timeout_s.", retryable=True) from None
+                    return None, last_id, retry_ms  # a cut connection: resumable when the server gave event ids
+                if not raw:
+                    break
+                total += len(raw)
+                if total > MAX_MESSAGE_BYTES:
+                    raise McpError("truncated", f"response stream over {MAX_MESSAGE_BYTES} bytes", ErrorCategory.resource_constraint, "Ask for less.")
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if line == "":
+                    if data_lines:
+                        found = self._sse_event("\n".join(data_lines), msg)
+                        data_lines = []
+                        if found is not None:
+                            return found, last_id, retry_ms
+                    continue
+                if line.startswith(":"):
+                    continue  # a comment or keep-alive
+                name, _, value = line.partition(":")
+                value = value[1:] if value.startswith(" ") else value
+                if name == "data":
+                    data_lines.append(value)
+                elif name == "id" and "\0" not in value:
+                    last_id = value
+                elif name == "retry" and value.isdigit():
+                    retry_ms = int(value)
         if data_lines:
             found = self._sse_event("\n".join(data_lines), msg)
             if found is not None:
-                return found
-        raise McpError("unavailable", f"the stream for {msg.get('method')} closed before the response", ErrorCategory.unavailable,
-                       "Retry the call once; the server may have dropped the connection.", retryable=True)
+                return found, last_id, retry_ms
+        return None, last_id, retry_ms
 
     def _sse_event(self, data: str, msg: dict[str, Any]) -> dict[str, Any] | None:
         if not data.strip():
@@ -561,10 +707,10 @@ class HttpTransport:
             if self.options.on_event:
                 self.options.on_event("log", {"level": "warning", "data": f"could not answer a server request: {e.message}"})
 
-    def _http_error(self, e: urllib.error.HTTPError, msg: dict[str, Any]) -> McpError:
+    def _http_error(self, e: urllib.error.HTTPError, msg: dict[str, Any], sid: str | None) -> McpError:
         try:
             raw = e.read(64 * 1024).decode("utf-8", errors="replace")
-        except OSError:
+        except (OSError, http.client.HTTPException):
             raw = ""
         body: Any = None
         try:
@@ -576,26 +722,41 @@ class HttpTransport:
         if e.code == 401 or (e.code == 403 and not (rpc and "origin" in str(rpc.get("message", "")).lower())):
             www = e.headers.get("WWW-Authenticate", "") if e.headers else ""
             said = redact(str(rpc.get("message")), secrets)[:200] if rpc else ""
-            return McpError("auth_required", f"{redact_url(self.spec.url)} refused the credentials (HTTP {e.code})" + (f": {said}" if said else "")
+            return McpError("auth_required", f"{self.display_url} refused the credentials (HTTP {e.code})" + (f": {said}" if said else "")
                             + (f"; it asks for: {redact(www, secrets)[:300]}" if www else ""),
                             ErrorCategory.permission_denied, "Set the connector's API key (see `edgent connectors list`); Edgent sends keys as headers and does not run OAuth.")
+        if sid and not self.modern and msg.get("method") != "initialize" and _session_lost(e.code, rpc, raw):
+            return McpError("session_expired", "the server no longer knows this session", ErrorCategory.unavailable, "Reconnect.", retryable=True, data={"session_id": sid})
         if rpc is not None:
             err = _rpc_error(rpc, secrets)
             err.data = err.data if err.data is not None else {"http_status": e.code}
-            if e.code == 404 and self.session_id and not self.modern:
-                err.code = "session_expired"
             return err
-        if e.code == 404 and self.session_id and not self.modern:
-            return McpError("session_expired", "the server ended the session", ErrorCategory.unavailable, "Reconnect.", retryable=True)
         if e.code == 429:
             retry = e.headers.get("Retry-After", "") if e.headers else ""
-            return McpError("rate_limited", f"rate limited by {redact_url(self.spec.url)}" + (f"; retry after {retry} s" if retry else ""),
+            return McpError("rate_limited", f"rate limited by {self.display_url}" + (f"; retry after {retry} s" if retry else ""),
                             ErrorCategory.resource_constraint, "Wait before calling this connector again.", retryable=True)
         detail = redact(raw.strip(), secrets)[:300]
         retryable = e.code >= 500
-        return McpError("server_error" if retryable else "protocol_error", f"HTTP {e.code} from {redact_url(self.spec.url)} for {msg.get('method', 'message')}" + (f": {detail}" if detail else ""),
+        return McpError("server_error" if retryable else "protocol_error", f"HTTP {e.code} from {self.display_url} for {msg.get('method', 'message')}" + (f": {detail}" if detail else ""),
                         ErrorCategory.unavailable if retryable else ErrorCategory.execution_failure,
                         "Retry once later." if retryable else "Check the connector URL and headers.", retryable=retryable, data={"http_status": e.code})
+
+
+def _param_headers(schema: dict[str, Any] | None, arguments: Any) -> dict[str, str]:
+    """2026-07-28: top-level parameters marked ``x-mcp-header`` are mirrored as ``Mcp-Param-<Name>`` headers."""
+    if not isinstance(schema, dict) or not isinstance(arguments, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, prop in (schema.get("properties") or {}).items():
+        name = prop.get("x-mcp-header") if isinstance(prop, dict) else None
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9-]+", name) or key not in arguments:
+            continue
+        value = arguments[key]
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        text = ("true" if value else "false") if isinstance(value, bool) else str(value)
+        out[f"Mcp-Param-{name}"] = header_value(text)
+    return out
 
 
 # --------------------------------------------------------------------------- the client
@@ -612,6 +773,8 @@ class McpClient:
         self.instructions: str = ""
         self.tools_changed = False
         self.tools_ttl_s: float | None = None
+        self.tools_partial = ""  # why the last tools/list stopped early, if it did
+        self._generation = 0  # bumped on every connect: one expired session is re-opened once, not once per thread
         self._ids = itertools.count(1)
         self._id_lock = threading.Lock()
         self._connect_lock = threading.Lock()
@@ -628,6 +791,7 @@ class McpClient:
             if self.connected:
                 return self.describe()
             self._close_transport()
+            self._generation += 1
             self._transport = StdioTransport(self.spec, self.options, self._on_stdio_message) if isinstance(self.spec, StdioSpec) else HttpTransport(self.spec, self.options, self._on_http_message)
             self._transport.start()
             try:
@@ -656,14 +820,18 @@ class McpClient:
             transport.close()
 
     def describe(self) -> dict[str, Any]:
-        return {"era": self.era, "protocol_version": self.protocol_version, "server_info": dict(self.server_info),
-                "capabilities": dict(self.capabilities), "instructions": self.instructions}
+        out = {"era": self.era, "protocol_version": self.protocol_version, "server_info": dict(self.server_info),
+               "capabilities": dict(self.capabilities), "instructions": self.instructions}
+        if self.tools_partial:
+            out["tools_partial"] = self.tools_partial
+        return out
 
     def stderr_tail(self) -> str:
         return self._transport.stderr_tail() if self._transport is not None else ""
 
     def _client_capabilities(self) -> dict[str, Any]:
-        return {"roots": {"listChanged": False}} if self.options.roots else {}
+        # roots are offered to legacy servers only: 2026-07-28 deprecates them and would ask through an input request
+        return {"roots": {"listChanged": False}} if self.options.roots and self.era != "modern" else {}
 
     def _client_info(self) -> dict[str, str]:
         return {"name": self.options.client_name, "version": self.options.client_version}
@@ -738,25 +906,40 @@ class McpClient:
         result = self._raw_request(method, params, timeout_s)
         kind = result.get("resultType", "complete")
         if kind == "input_required":
-            raise McpError("input_required", f"the server needs input Edgent cannot give (it asked for {', '.join(sorted((result.get('inputRequests') or {}).keys())) or 'interaction'})",
+            asks = result.get("inputRequests") if isinstance(result.get("inputRequests"), dict) else {}
+            methods = sorted({str(v.get("method")) for v in asks.values() if isinstance(v, dict) and v.get("method")}) or ["an interaction"]
+            raise McpError("input_required", f"the server needs input Edgent cannot give ({', '.join(methods)})",
                            ErrorCategory.unsupported, "Do the step in the service's own interface, then retry; Edgent answers no elicitation or sampling requests.")
         if kind != "complete":
             raise McpError("protocol_error", f"unknown resultType {kind!r}", ErrorCategory.execution_failure, "Report it to the server's maintainers.")
         return result
 
     def request(self, method: str, params: dict[str, Any] | None = None, timeout_s: float | None = None) -> dict[str, Any]:
-        """One request on a connected client; a legacy HTTP session the server ended is re-opened once."""
+        """One request on a connected client, within one deadline that also covers (re)connecting; a legacy HTTP
+        session the server ended is re-opened once, by whichever thread sees it first."""
         timeout = self.options.request_timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout
         if not self.connected:
             self.connect()
+        generation = self._generation
         try:
-            return self._request(method, params or {}, timeout)
+            return self._request(method, params or {}, self._remaining(deadline, method))
         except McpError as e:
             if e.code != "session_expired":
                 raise
-            self.close()
+            with self._connect_lock:
+                if self._generation == generation:  # nobody has re-opened it yet
+                    self._close_transport()
             self.connect()
-            return self._request(method, params or {}, timeout)
+            return self._request(method, params or {}, self._remaining(deadline, method))
+
+    @staticmethod
+    def _remaining(deadline: float, method: str) -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise McpError("timeout", f"{method} ran out of time while connecting", ErrorCategory.timeout,
+                           "Retry once; the connector was slow to start.", retryable=True)
+        return left
 
     def _notify(self, method: str, params: dict[str, Any]) -> None:
         if self._transport is not None:
@@ -765,8 +948,10 @@ class McpClient:
     def list_tools(self) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         seen: set[str] = set()
+        cursors: set[str] = set()
         cursor: str | None = None
-        for _page in range(MAX_LIST_PAGES):
+        self.tools_partial = ""
+        for page in range(MAX_LIST_PAGES):
             result = self.request("tools/list", {"cursor": cursor} if cursor else {})
             ttl = result.get("ttlMs")
             if isinstance(ttl, (int, float)) and ttl > 0:
@@ -776,9 +961,20 @@ class McpClient:
                     seen.add(t["name"])
                     tools.append(t)
             nxt = result.get("nextCursor")
-            if not nxt or nxt == cursor:
+            if not nxt:
+                break
+            if str(nxt) in cursors:
+                self.tools_partial = "the server repeated a page cursor"
+                break
+            if page == MAX_LIST_PAGES - 1:
+                self.tools_partial = f"stopped after {MAX_LIST_PAGES} pages"
                 break
             cursor = str(nxt)
+            cursors.add(cursor)
+        if self.tools_partial:
+            self._event("log", {"level": "warning", "data": f"tool list may be incomplete: {self.tools_partial}"})
+        if isinstance(self._transport, HttpTransport):
+            self._transport.tool_schemas = {str(t["name"]): t.get("inputSchema") for t in tools if isinstance(t.get("inputSchema"), dict)}
         self.tools_changed = False
         return tools
 

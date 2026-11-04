@@ -149,7 +149,8 @@ def test_tools_are_listed_registered_cached_and_called(ws):
     assert not r.ok and r.error.code == "connector_tool_error" and r.error.remediation
     r = reg.call("mcp__fake__resource", {}, ctx)
     assert r.ok and r.output["links"] and "[resource" in r.output["text"]
-    cache = json.loads((ws.path("cache") / "connectors" / "fake.json").read_text())
+    cache = json.loads(m._cache_path("fake").read_text())
+    assert ws.root not in m._cache_path("fake").parents  # outside the workspace the model can write to
     assert [t["name"] for t in cache["tools"]][:2] == ["echo", "add"]
     m.close_all()
 
@@ -213,7 +214,7 @@ def test_secrets_never_reach_the_cache_status_or_errors(ws):
     m.close_all()
     m, _ = manager(ws, {"fake": fake_entry(env={"API_KEY": "${MY_KEY}"})}, environ={"MY_KEY": secret})
     m.ensure()
-    assert secret not in (ws.path("cache") / "connectors" / "fake.json").read_text()
+    assert secret not in m._cache_path("fake").read_text()
     m.close_all()
 
 

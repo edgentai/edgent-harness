@@ -66,6 +66,8 @@ CLAUDE_TOOL_NAMES: dict[str, tuple[str, ...]] = {
     "tool_search": ("ToolSearch",),  # Claude Code loads deferred tool schemas with its own ToolSearch
 }
 _AGENT_TOOL_KEYS = ("tools", "disallowedTools", "disallowed_tools")
+# Edgent's connectors are not re-exported over MCP: a host uses its own, so the skill that explains Edgent's stays home
+HOST_EXCLUDED_SKILLS = frozenset({"connectors"})
 _AGENT_EDGENT_ONLY_KEYS = ("effort",)  # front-matter keys Claude Code does not define; name, description, skills, maxTurns, background and model it does
 
 Action = Literal["create", "update", "noop"]
@@ -453,6 +455,8 @@ def plan_skills(host: str, workspace: Any, source_dir: str | os.PathLike[str] | 
     if paths.skills is not None:
         source = Path(source_dir) if source_dir is not None else builtin_skills_dir()
         for skill_dir in _skill_dirs(source):
+            if source_dir is None and skill_dir.name in HOST_EXCLUDED_SKILLS:
+                continue
             for rel in _skill_files(skill_dir):
                 out.append(_file_change(skill_dir / rel, paths.skills / skill_dir.name / rel, f"skill {skill_dir.name} ({rel})"))
     if paths.agents is not None:

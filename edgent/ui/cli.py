@@ -493,6 +493,8 @@ def _connector_test(app: Any, name: str) -> int:
     print(f"{name}: connected to {info.get('name', '?')} {info.get('version', '')} over {report.get('transport')} (MCP {server.get('protocol_version')}, {server.get('era')} era)")
     tools = report.get("tools") or []
     print(f"  {len(tools)} tools{' (deferred: the model loads them with tool_search)' if report.get('deferred') else ''}: {', '.join(tools[:40])}{' ...' if len(tools) > 40 else ''}")
+    for warning in report.get("warnings") or []:
+        print(f"  warning: {warning}", file=sys.stderr)
     return 0
 
 
@@ -513,6 +515,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
     for w in written:
         print(f"wrote {w}")
     print(f"done. Restart {args.host} and run `edgent doctor --host {args.host}` to confirm.")
+    configured = [c.name for c in app.connectors.configs()]
+    if configured:
+        print(f"note: Edgent's connectors ({', '.join(configured)}) are not shared with {args.host}; add the ones you want there with "
+              f"{args.host}'s own MCP settings (for example `claude mcp add --transport http perplexity https://api.perplexity.ai/mcp --header \"Authorization: Bearer $PERPLEXITY_API_KEY\"`).")
     return 0
 
 

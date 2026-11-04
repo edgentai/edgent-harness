@@ -152,6 +152,7 @@ class App:
         build = self.settings.get("build") if isinstance(self.settings.get("build"), dict) else {}
         if not build.get("network", True):
             return []
+        self.ensure_connectors()  # a connector never listed before has no tools yet, and so nothing to allow
         readonly = [s.name for s in self.registry.specs("connector") if not s.side_effects]
         return [*BUILD_NETWORK_TOOLS, *readonly]
 

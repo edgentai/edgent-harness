@@ -39,6 +39,7 @@ from .skills import SkillIndex
 from .subagents import AgentIndex, SubagentRunner
 
 MAX_PROVIDER_RETRIES = 2
+MAX_TOOLS_PER_REQUEST = 128  # tool schemas in one request (count); OpenAI's chat API refuses more
 RETRY_BACKOFF_S = (1.0, 2.0)
 TURN_ERRORS_MAX = 50
 EVENT_PREVIEW_CHARS = 300
@@ -145,6 +146,7 @@ class AgentLoop:
         self._cancel = threading.Event()
         self._session_started = False
         self._overhead_tokens = 0
+        self._tools_trimmed_reported = False
         self._reset_turn()
 
     @classmethod
@@ -269,12 +271,13 @@ class AgentLoop:
         compact = self.context.config.compact_schemas and bool(caps.max_prompt_bytes)
         visible = self._visible_tools()
         activated = self.activated_tools()
+        schemas = self._cap_tools(self.registry.openai_schemas(self.allowlist, compact=compact, activated=activated))
         try:
             request = self.context.build_request(
                 self.session,
                 self.workspace,
                 system_prompt=self.system_prompt,
-                tool_schemas=self.registry.openai_schemas(self.allowlist, compact=compact, activated=activated),
+                tool_schemas=schemas,
                 effort=self.effort,  # type: ignore[arg-type]
                 max_tokens=self.max_tokens,
                 role=self.role,
@@ -292,6 +295,25 @@ class AgentLoop:
             return self._build_request(extra_context, allow_compaction=False)
         self._overhead_tokens = sum(m.tokens() for m in request.messages if m.role == "system") + 60 * len(request.tools)
         return request
+
+    def _cap_tools(self, schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """At most MAX_TOOLS_PER_REQUEST schemas (OpenAI refuses more than 128): Edgent's own tools first, then connector
+        tools in registry order; the ones left out stay callable by name and are reported once."""
+        if len(schemas) <= MAX_TOOLS_PER_REQUEST:
+            return schemas
+
+        def origin(schema: dict[str, Any]) -> str:
+            spec = self.registry.get(schema.get("function", schema).get("name", ""))
+            return getattr(spec, "origin", "") if spec is not None else ""
+
+        ordered = [s for s in schemas if not origin(s)] + [s for s in schemas if origin(s)]
+        kept, dropped = ordered[:MAX_TOOLS_PER_REQUEST], ordered[MAX_TOOLS_PER_REQUEST:]
+        names = [s.get("function", s).get("name") for s in dropped]
+        if not self._tools_trimmed_reported:
+            self._tools_trimmed_reported = True
+            self._trace("tools_trimmed", {"limit": MAX_TOOLS_PER_REQUEST, "dropped": names[:50], "count": len(names)})
+            self._emit({"type": "warning", "session_id": self.session.session_id, "text": f"{len(names)} tool schemas left out: over {MAX_TOOLS_PER_REQUEST} per request"})
+        return kept
 
     def _visible_tools(self) -> set[str]:
         names = set(self.registry.names())
