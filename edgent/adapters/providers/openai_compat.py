@@ -11,16 +11,21 @@ Effort reaches the model in whichever way the server understands:
 SGLang serving Qwen-style models; ``low`` switches thinking off), and
 ``reasoning_effort_param=True`` sends ``reasoning_effort`` (OpenAI o-series and
 servers that copy it) and omits ``temperature``, which those models refuse; a
-server that takes both can get it back through ``extra_body``. Reasoning comes back from ``reasoning_content`` or
+server that takes both can get it back through ``extra_body``. Left unset, it
+switches itself on for the o-series and gpt-5 families (``is_reasoning_model``),
+and ``api.openai.com`` always gets ``max_completion_tokens``, the only spelling
+every current model there accepts. Reasoning comes back from ``reasoning_content`` or
 ``reasoning`` fields, or from a ``<think>...</think>`` block in the content,
 and is split out of the visible text either way.
 """
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 from ...domain.capabilities import Capabilities
 from ...domain.errors import ConfigurationError, ErrorCategory, HarnessError
@@ -54,6 +59,34 @@ THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
 AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3"}
 HEALTH_MODELS_SHOWN = 20
+OPENAI_HOSTS = frozenset({"api.openai.com"})  # hosts whose every current model wants max_completion_tokens
+REASONING_MODEL_RE = re.compile(r"^(o\d|gpt-5)", re.IGNORECASE)  # families that refuse max_tokens and temperature
+UNSUPPORTED_PARAMETER_RE = re.compile(r"unsupported parameter|max_tokens|temperature|reasoning_effort", re.IGNORECASE)
+MAX_COMPLETION_TOKENS_PARAM = "max_completion_tokens"
+MAX_TOKENS_PARAM = "max_tokens"
+
+
+def is_reasoning_model(model: str) -> bool:
+    """OpenAI's o-series and gpt-5 family: they take ``reasoning_effort`` and refuse ``max_tokens`` and ``temperature``."""
+    return bool(REASONING_MODEL_RE.match((model or "").strip()))
+
+
+def hosted_by_openai(base_url: str) -> bool:
+    try:
+        host = (urlsplit(base_url or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return host in OPENAI_HOSTS
+
+
+def reasoning_defaults(base_url: str | None, model: str | None) -> dict[str, Any]:
+    """Constructor options the factory and the provider both derive from the base URL and the model (explicit settings win)."""
+    out: dict[str, Any] = {}
+    if is_reasoning_model(model or ""):
+        out["reasoning_effort_param"] = True
+    if out.get("reasoning_effort_param") or hosted_by_openai(base_url or ""):
+        out["max_tokens_param"] = MAX_COMPLETION_TOKENS_PARAM
+    return out
 
 
 def split_think(text: str) -> tuple[str, str | None]:
@@ -105,7 +138,7 @@ class OpenAICompatProvider(Provider):
         opener: Opener | None = None,
         caps: Capabilities | None = None,
         thinking_switch: bool = False,
-        reasoning_effort_param: bool = False,
+        reasoning_effort_param: bool | None = None,
         prices: Mapping[str, float] | None = None,
         max_tokens_param: str | None = None,
         extra_body: Mapping[str, Any] | None = None,
@@ -124,6 +157,9 @@ class OpenAICompatProvider(Provider):
         self.max_retries = int(max_retries)
         self.opener = opener
         self.thinking_switch = thinking_switch
+        defaults = reasoning_defaults(self.base_url, model)
+        if reasoning_effort_param is None:  # unset: the model family decides
+            reasoning_effort_param = bool(defaults.get("reasoning_effort_param", False))
         self.reasoning_effort_param = reasoning_effort_param
         if caps is None:
             control = "switch" if (thinking_switch or reasoning_effort_param) else "none"
@@ -137,8 +173,11 @@ class OpenAICompatProvider(Provider):
             )
         self.caps = caps
         self.prices = dict(prices) if prices else None
-        # OpenAI's reasoning models reject max_tokens; everything else still speaks max_tokens.
-        self.max_tokens_param = max_tokens_param or ("max_completion_tokens" if reasoning_effort_param else "max_tokens")
+        # OpenAI's reasoning models reject max_tokens, and api.openai.com takes max_completion_tokens for every model;
+        # other servers still speak max_tokens.
+        self.max_tokens_param = max_tokens_param or (
+            MAX_COMPLETION_TOKENS_PARAM if (reasoning_effort_param or hosted_by_openai(self.base_url)) else MAX_TOKENS_PARAM
+        )
         self.extra_body = dict(extra_body or {})
         self.backoff_s = backoff_s
         self.ids = ids or IdGenerator()
@@ -153,17 +192,20 @@ class OpenAICompatProvider(Provider):
         payload = self.build_payload(req)
         request_id = self.ids.new("req")
         t0 = time.monotonic()
-        data = post_json(
-            f"{self.base_url}/chat/completions",
-            payload,
-            headers=self._headers(),
-            timeout_s=self.timeout_s,
-            opener=self.opener,
-            retries=self.max_retries,
-            backoff_s=self.backoff_s,
-            request_id=request_id,
-            sleep=self.sleep,
-        )
+        try:
+            data = post_json(
+                f"{self.base_url}/chat/completions",
+                payload,
+                headers=self._headers(),
+                timeout_s=self.timeout_s,
+                opener=self.opener,
+                retries=self.max_retries,
+                backoff_s=self.backoff_s,
+                request_id=request_id,
+                sleep=self.sleep,
+            )
+        except ProviderError as e:
+            raise self._with_parameter_hint(e) from e
         try:
             reply = self.parse_response(data)
         except (KeyError, TypeError, AttributeError, IndexError, ValueError) as e:
@@ -196,10 +238,34 @@ class OpenAICompatProvider(Provider):
         payload.update(self.extra_body)
         return payload
 
+    def _with_parameter_hint(self, e: ProviderError) -> ProviderError:
+        """A 400 that names max_tokens, temperature or reasoning_effort gets the options that switch them."""
+        if e.status not in (400, 422) or not UNSUPPORTED_PARAMETER_RE.search(str(e)):
+            return e
+        other = MAX_TOKENS_PARAM if self.max_tokens_param == MAX_COMPLETION_TOKENS_PARAM else MAX_COMPLETION_TOKENS_PARAM
+        sent = self.max_tokens_param + ("" if self.reasoning_effort_param else " and temperature")
+        hint = (
+            f" This request sent {sent}; set settings.provider.options.reasoning_effort_param to "
+            f"{'false' if self.reasoning_effort_param else 'true (o-series and gpt-5 models)'} or max_tokens_param to {other!r}."
+        )
+        e.error.remediation = (e.error.remediation or "").rstrip() + hint
+        return e
+
     # ------------------------------------------------------------------ request shape
     def convert_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        pending_media: list[dict[str, Any]] = []  # attachments of the tool results answering one assistant turn
+
+        def flush_media() -> None:
+            # tool messages carry text only in this API, and every tool result must directly follow the assistant's
+            # tool_calls message, so the attachments of the whole run ride on ONE user turn after the last result
+            if pending_media:
+                out.append({"role": "user", "content": list(pending_media)})
+                pending_media.clear()
+
         for m in messages:
+            if m.role != "tool":
+                flush_media()
             if m.role == "system":
                 out.append({"role": "system", "content": m.plain_text()})
             elif m.role == "user":
@@ -208,10 +274,11 @@ class OpenAICompatProvider(Provider):
                 out.append(self._assistant(m))
             elif m.role == "tool":
                 out.append({"role": "tool", "tool_call_id": m.tool_call_id or "", "content": m.text()})
-                media = [self._media_part(p) for p in m.media()]
-                media = [p for p in media if p is not None]
-                if media:  # tool messages carry text only in this API; attachments ride on a user turn
-                    out.append({"role": "user", "content": [{"type": "text", "text": f"[attachment from tool {m.name or '?'}]"}, *media]})
+                media = [p for p in (self._media_part(p) for p in m.media()) if p is not None]
+                if media:
+                    pending_media.append({"type": "text", "text": f"[attachment from tool {m.name or '?'}]"})
+                    pending_media.extend(media)
+        flush_media()
         return out
 
     def _assistant(self, m: Message) -> dict[str, Any]:

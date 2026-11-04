@@ -19,6 +19,22 @@ from ..domain.utils import parse_front_matter, slugify
 _CITE_RE = re.compile(r"\[([a-z0-9][a-z0-9\-_]*):(p\.\d+|t=\d{1,2}:\d{2}(?::\d{2})?|L\d+)\]")
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*(film|widget|exercises)\s*:\s*([a-zA-Z0-9\-_]+)\s*\}\}")
 _MATH_SPLIT_RE = re.compile(r"(\$\$.+?\$\$|\$[^$\n]+?\$)", re.DOTALL)
+_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):")
+LINK_SCHEMES = frozenset({"http", "https", "mailto"})  # what an <a href> may point at; anything else becomes "#"
+IMAGE_SCHEMES = frozenset({"http", "https", "data"})  # what an <img src> may load; the reader's CSP allows data: images
+
+
+def _attr(value: str) -> str:
+    """Make text that is already escaped for element content safe inside a double-quoted attribute."""
+    return value.replace('"', "&quot;").replace("'", "&#x27;")
+
+
+def _url(value: str, schemes: frozenset[str]) -> str:
+    """An attribute-safe URL: relative and fragment URLs pass; an absolute URL must use one of ``schemes``."""
+    m = _SCHEME_RE.match(value)
+    if m and m.group(1).lower() not in schemes:
+        return "#"
+    return _attr(value)
 
 
 def _inline(text: str) -> str:
@@ -32,9 +48,9 @@ def _inline(text: str) -> str:
             continue
         s = html.escape(chunk, quote=False)
         s = re.sub(r"`([^`]+)`", lambda m: f"<code>{m.group(1)}</code>", s)
-        s = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", lambda m: f'<img alt="{m.group(1)}" src="{m.group(2)}">', s)
+        s = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", lambda m: f'<img alt="{_attr(m.group(1))}" src="{_url(m.group(2), IMAGE_SCHEMES)}">', s)
         s = _CITE_RE.sub(lambda m: f'<span class="cite" data-locator="{m.group(1)}:{m.group(2)}">[{m.group(1)}:{m.group(2)}]</span>', s)
-        s = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', s)
+        s = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", lambda m: f'<a href="{_url(m.group(2), LINK_SCHEMES)}">{m.group(1)}</a>', s)
         s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
         s = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?![*\w])", r"<em>\1</em>", s)
         s = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<em>\1</em>", s)

@@ -6,6 +6,15 @@ into a level-0 note (what was asked, what was concluded, decisions, open
 questions, constraints, paths and locators). Stage 3 rolls notes up into
 higher levels when they pile up, so notes grow with the logarithm of the
 conversation. The transcript on disk keeps everything verbatim for recall.
+
+The recent window (``keep_recent_messages``) is protected from stages 1 and 2
+while compaction is proactive. When it is forced (the provider refused the
+prompt) and the ordinary stages cannot free enough, both stages reach into the
+window from the oldest message onward, never past the current turn: the last
+user message and the tool results after it stay as they are, because the model
+has not seen them yet. For providers with a byte ceiling, the window the
+compactor measures against is narrowed to that ceiling, so compaction fires
+before the ceiling is hit rather than after.
 """
 from __future__ import annotations
 
@@ -26,6 +35,7 @@ SUMMARY_MAX_TOKENS = 700
 SUMMARY_MESSAGE_MAX_CHARS = 2000
 SUMMARY_INPUT_MAX_CHARS = 24_000
 NOTE_TRUNCATION_MARKER = " …[note truncated]"
+BYTES_PER_TOKEN_ESTIMATE = 4  # mirrors domain.utils.estimate_tokens: a byte ceiling becomes a token window by this factor
 
 COMPACTOR_INSTRUCTION = (
     "You are the compactor for an agent's own working memory. Summarise the exchange below so the agent can "
@@ -72,6 +82,7 @@ class CompactionReport:
     tool_results_cleared: int = 0
     rolled_up: int = 0
     summariser: str = "none"  # provider | extractive | custom | none
+    reached_recent_window: bool = False  # forced compaction had to clear or summarise inside the protected window
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +93,7 @@ class CompactionReport:
             "tool_results_cleared": self.tool_results_cleared,
             "rolled_up": self.rolled_up,
             "summariser": self.summariser,
+            "reached_recent_window": self.reached_recent_window,
         }
 
 
@@ -183,20 +195,42 @@ class Compactor:
         """What the session costs in the window: live messages, notes, and a caller-supplied overhead (system messages, schemas)."""
         return session.tokens() + session.notes_tokens() + max(0, overhead_tokens)
 
+    def window_tokens(self, context_tokens: int) -> int:
+        """The window compaction measures against: the token window, narrowed to the provider's byte ceiling when it has one.
+
+        The loop hands the compactor the provider it talks to, so a byte-ceiling provider (agy) compacts before the
+        ceiling is reached instead of only after it refused the prompt.
+        """
+        ceiling = getattr(getattr(self.provider, "caps", None), "max_prompt_bytes", None)
+        if not ceiling:
+            return context_tokens
+        by_bytes = int(ceiling) // BYTES_PER_TOKEN_ESTIMATE
+        return min(context_tokens, by_bytes) if context_tokens > 0 else by_bytes
+
     def pressure(self, session: Session, context_tokens: int, overhead_tokens: int = 0) -> float:
         """Fraction of the context window the session would occupy."""
-        if context_tokens <= 0:
+        window = self.window_tokens(context_tokens)
+        if window <= 0:
             return 0.0
-        return self.occupied_tokens(session, overhead_tokens) / context_tokens
+        return self.occupied_tokens(session, overhead_tokens) / window
+
+    @staticmethod
+    def current_turn_start(messages: list[Message]) -> int:
+        """Index of the last user message: the current turn, which forced compaction never touches. 0 when there is none."""
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].role == "user":
+                return i
+        return 0
 
     def maybe_compact(self, session: Session, context_tokens: int, force: bool = False, overhead_tokens: int = 0) -> CompactionReport:
         """Run the stages until the measure ``pressure`` uses is at or under ``target_ratio`` of the window (all stages when forced)."""
         limits = self.limits
         before = session.tokens()
         report = CompactionReport(before_tokens=before, after_tokens=before)
-        if context_tokens <= 0 and not force:
+        window = self.window_tokens(context_tokens)
+        if window <= 0 and not force:
             return report  # no window to measure against: nothing to do unless forced
-        target = limits.target_ratio * max(0, context_tokens)
+        target = limits.target_ratio * max(0, window)
         if not force and self.occupied_tokens(session, overhead_tokens) <= target:
             return report
         report.tool_results_cleared = self.clear_old_tool_results(session)
@@ -208,6 +242,8 @@ class Compactor:
             summarised_once = True
             report.notes_added += 1
             report.stage_reached = 2
+        if force and (not (report.tool_results_cleared or report.notes_added) or self.occupied_tokens(session, overhead_tokens) > target):
+            self._compact_recent_window(session, report, target, overhead_tokens)
         if report.notes_added or force:
             report.rolled_up = self.roll_up(session)
             if report.rolled_up:
@@ -217,9 +253,33 @@ class Compactor:
         session.save()
         return report
 
+    def _compact_recent_window(self, session: Session, report: CompactionReport, target: float, overhead_tokens: int) -> None:
+        """Forced and still too big: clear, then summarise, inside the recent window, oldest first, never into the current turn.
+
+        Clearing is lossless (every result is persisted). Summarising recent turns loses detail, so it happens only
+        when clearing freed nothing at all or the measure is still over the target.
+        """
+        cleared = self.clear_old_tool_results(session, keep=self._current_turn_length(session))
+        report.tool_results_cleared += cleared
+        freed = bool(report.tool_results_cleared or report.notes_added)
+        while not freed or self.occupied_tokens(session, overhead_tokens) > target:
+            if not self.summarise_oldest_block(session, force=True, keep=self._current_turn_length(session)):
+                break
+            freed = True
+            report.notes_added += 1
+            report.stage_reached = 2
+            report.reached_recent_window = True
+        if cleared:
+            report.reached_recent_window = True
+
+    def _current_turn_length(self, session: Session) -> int:
+        """How many trailing messages belong to the current turn (the last user message and everything after it)."""
+        return len(session.messages) - self.current_turn_start(session.messages)
+
     # ------------------------------------------------------------------ stage 1
-    def clear_old_tool_results(self, session: Session) -> int:
-        keep = self.limits.keep_recent_messages
+    def clear_old_tool_results(self, session: Session, keep: int | None = None) -> int:
+        """Replace tool results older than the last ``keep`` messages (default: the recent window) with pointers."""
+        keep = self.limits.keep_recent_messages if keep is None else keep
         old = session.messages[:-keep] if keep > 0 else list(session.messages)
         cleared = 0
         for m in old:
@@ -247,14 +307,15 @@ class Compactor:
             return str(p)
 
     # ------------------------------------------------------------------ stage 2
-    def cut_index(self, messages: list[Message], force: bool = False) -> int:
+    def cut_index(self, messages: list[Message], force: bool = False, keep: int | None = None) -> int:
         """How many of the oldest messages form the next block. 0 when nothing can be summarised safely.
 
         Prefers a cut where the kept conversation starts with a user message, then one that at least does not
-        split an assistant tool call from its results; the recent window is never touched.
+        split an assistant tool call from its results; the last ``keep`` messages (default: the recent window) are
+        never touched.
         """
         limits = self.limits
-        n_old = len(messages) - limits.keep_recent_messages
+        n_old = len(messages) - (limits.keep_recent_messages if keep is None else keep)
         if n_old <= 0:
             return 0
         if n_old >= limits.block_size:
@@ -271,8 +332,8 @@ class Compactor:
                 return i
         return 0
 
-    def summarise_oldest_block(self, session: Session, force: bool = False) -> bool:
-        cut = self.cut_index(session.messages, force)
+    def summarise_oldest_block(self, session: Session, force: bool = False, keep: int | None = None) -> bool:
+        cut = self.cut_index(session.messages, force, keep)
         if cut == 0:
             return False
         block = session.messages[:cut]

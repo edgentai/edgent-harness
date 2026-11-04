@@ -162,3 +162,20 @@ def test_api_key_inside_options_gets_the_plain_text_warning_and_api_key_env_wins
     settings["provider"]["api_key_env"] = "SRV_KEY"
     q = make_provider(settings=settings, environ={"SRV_KEY": "env-secret-123456"}, which=NOTHING)
     assert q.api_key == "env-secret-123456" and q.meta["warnings"] == []
+
+
+def test_openai_reasoning_defaults_are_decided_in_the_spec_and_overridable():
+    hosted = resolve_spec(environ={"OPENAI_API_KEY": "sk-123456", "EDGENT_OPENAI_MODEL": "gpt-5"}, which=NOTHING)
+    assert hosted.options == {"reasoning_effort_param": True, "max_tokens_param": "max_completion_tokens"}
+    assert sorted(hosted.describe()["options"]) == ["max_tokens_param", "reasoning_effort_param"]
+    p = make_provider(environ={"OPENAI_API_KEY": "sk-123456", "EDGENT_OPENAI_MODEL": "gpt-5"}, which=NOTHING)
+    assert isinstance(p, OpenAICompatProvider) and p.reasoning_effort_param and p.max_tokens_param == "max_completion_tokens"
+    plain_hosted = resolve_spec(environ={"OPENAI_API_KEY": "sk-123456", "OPENAI_MODEL": "gpt-4o"}, which=NOTHING)
+    assert plain_hosted.options == {"max_tokens_param": "max_completion_tokens"}
+    local = resolve_spec(environ={"OPENAI_BASE_URL": "http://localhost:8000/v1", "OPENAI_MODEL": "qwen3"}, which=NOTHING)
+    assert local.options == {}
+    settings = {"provider": {"kind": "openai", "model": "gpt-5", "options": {"reasoning_effort_param": False}}}
+    forced = resolve_spec(settings=settings, environ={"OPENAI_API_KEY": "sk-123456"}, which=NOTHING)
+    assert forced.options == {"reasoning_effort_param": False, "max_tokens_param": "max_completion_tokens"}
+    assert not make_provider(settings=settings, environ={"OPENAI_API_KEY": "sk-123456"}, which=NOTHING).reasoning_effort_param
+    assert "max_completion_tokens" in describe_options() and "gpt-5" in describe_options()

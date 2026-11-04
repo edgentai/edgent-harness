@@ -125,14 +125,17 @@ def resolve_spec(
         api_key = _resolve_key(conf, env, OPENAI_KEY_ENVS, warnings)
         base_url = base_url or _first(env, OPENAI_BASE_URL_ENVS)[0] or None
         model = model or _first(env, OPENAI_MODEL_ENVS)[0] or env.get(MODEL_ENV) or None
+        from .openai_compat import DEFAULT_BASE_URL, reasoning_defaults
+
         if not base_url:
             if not api_key:
                 raise ConfigurationError("provider openai needs a base URL: set EDGENT_OPENAI_BASE_URL (for example http://localhost:8000/v1) or settings.provider.base_url.")
-            from .openai_compat import DEFAULT_BASE_URL
-
             base_url = DEFAULT_BASE_URL
         if not model:
             raise ConfigurationError("provider openai needs a model id: set EDGENT_OPENAI_MODEL (or OPENAI_MODEL, EDGENT_MODEL) or settings.provider.model; `edgent doctor` lists what the server serves.")
+        # api.openai.com and the o-series/gpt-5 families refuse max_tokens (and temperature): decide the parameter
+        # spellings here so `edgent doctor` shows them; an explicit settings option still wins
+        options = {**reasoning_defaults(base_url, model), **options}
     else:
         model = model or env.get(MODEL_ENV) or None
     return ProviderSpec(kind=chosen, model=model, api_key=api_key, base_url=base_url, options=options, source=source, warnings=warnings)
@@ -246,6 +249,8 @@ def describe_options() -> str:
         '                "api_key_env": "MY_SERVER_KEY", "options": {"thinking_switch": true}}}',
         "Put keys in environment variables and name the variable in api_key_env; a plain api_key in the file is accepted with a warning.",
         "options are passed to the provider constructor (for example thinking_switch, reasoning_effort_param, timeout_s, thinking_budgets, prices).",
+        "For openai, an o-series or gpt-5 model gets reasoning_effort_param=true (reasoning_effort, no temperature) and api.openai.com gets",
+        "max_tokens_param=max_completion_tokens by default; set either option explicitly to override.",
     ]
     return "\n".join(lines)
 

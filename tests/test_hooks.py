@@ -75,7 +75,8 @@ def test_command_hook_other_exit_and_timeout_continue(workspace):
     assert [d["returncode"] for d in data] == [1, -9] and data[1]["timed_out"] is True and data[0]["stderr"] == "boom"
 
 
-def test_command_hook_runs_sandboxed_in_workspace(workspace):
+def test_command_hook_runs_sandboxed_in_workspace(workspace, monkeypatch):
+    monkeypatch.setenv("AWS_SECRET", "hunter2")  # present in the harness process; the hook must not see it
     cmd = write_hook(workspace, "env", "import os, json\nprint(json.dumps({'message': os.getcwd() + '|' + str('AWS_SECRET' in os.environ)}))\n")
     runner = HookRunner({"hooks": {"SessionStart": [{"command": cmd}]}}, workspace)
     out = runner.run("SessionStart", {"session_id": "s"})

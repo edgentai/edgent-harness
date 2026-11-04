@@ -108,6 +108,8 @@ def _check_path(ws: Any, path: Any) -> str | None:
         ws.resolve(path)
     except WorkspaceError as e:
         return str(e)
+    except ValueError as e:  # a NUL byte or another character the filesystem refuses
+        return f"path is not a valid file path: {e}"
     return None
 
 

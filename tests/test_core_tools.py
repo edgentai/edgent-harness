@@ -1,7 +1,6 @@
 """Core tools through the registry: files, search, sandbox, web (fake opener), delegation and session state."""
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -223,10 +222,13 @@ def test_grep_hits_context_truncation_and_errors(tools: ToolRegistry, ctx: ToolC
 # ----------------------------------------------------------------------------- bash and run_python
 def test_bash_in_the_sandbox(tools: ToolRegistry, ctx: ToolContext, workspace: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EDGENT_TEST_SECRET", "hunter2")
+    workspace.write_text(".bash_profile", "echo PROFILE-RAN\n")  # a workspace file is data; a login shell would run it on every call
+    workspace.write_text(".bashrc", "echo RC-RAN\n")
     out = ok(tools, ctx, "bash", command="echo hi; pwd; echo secret=$EDGENT_TEST_SECRET; echo home=$HOME")
     assert out["returncode"] == 0 and not out["timed_out"] and not out["truncated"] and out["duration_s"] >= 0
     lines = out["stdout"].splitlines()
-    assert lines[0] == "hi" and Path(lines[1]).resolve() == workspace.root and lines[2] == "secret=" and lines[3] == f"home={workspace.root}"
+    assert lines[0] == "hi" and Path(lines[1]).resolve() == workspace.root and lines[2] == "secret=" and lines[3] == f"home={workspace.root / core.BASH_HOME_REL}"
+    assert "PROFILE-RAN" not in out["stdout"] and "RC-RAN" not in out["stdout"]
     out = ok(tools, ctx, "bash", command="echo oops >&2; exit 3")
     assert out["returncode"] == 3 and out["stderr"].strip() == "oops"
     out = ok(tools, ctx, "bash", command="sleep 5", timeout_s=1)
@@ -419,7 +421,8 @@ def test_tool_results_are_json_serialisable(tools: ToolRegistry, ctx: ToolContex
                        ("bash", {"command": "echo 1"}), ("todo_read", {}), ("session_recall", {"query": "coins"})):
         r = call(tools, ctx, name, **args)
         assert r.ok and json.loads(r.as_text()) is not None, name
-    assert os.path.isdir(workspace.path("tool_results")) or True
+    big = ok(tools, ctx, "bash", command="printf 'a%.0s' $(seq 1 30000)")
+    assert big["truncated"] and json.loads(json.dumps(big))["truncated"]  # a truncated sandbox result is still a plain JSON object
 
 
 # ----------------------------------------------------------------------------- review additions: first-hour paths

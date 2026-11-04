@@ -10,7 +10,10 @@ import pytest
 
 from edgent.adapters.providers.base import ProviderError
 from edgent.adapters.providers.gemini import (
+    ANY_JSON_STRING_NOTE,
+    ANY_VALUE_SCHEMA,
     INLINE_MEDIA_LIMIT,
+    TOOL_MEDIA_LABEL,
     GeminiProvider,
     clean_schema,
     decode_json_strings,
@@ -263,19 +266,63 @@ def test_inline_image_data_and_media_limit(tmp_path: Path):
     assert ei2.value.category.value == "not_found"
 
 
-def test_tool_message_media_rides_in_the_same_user_content(tmp_path: Path):
+def test_tool_message_media_follows_the_function_response_turn(tmp_path: Path):
+    """The turn after a function call holds function responses only; attached media rides on the next user turn."""
     shot = tmp_path / "shot.jpg"
     shot.write_bytes(b"\xff\xd8\xff" + b"\x00" * 8)
     opener = FakeOpener(text_response("looks fine"))
     p, _ = make(opener)
     history = [
         Message.user("check the page"),
-        Message.assistant("", [ToolCall("call_1", "screenshot", {})]),
+        Message.assistant("", [ToolCall("call_1", "screenshot", {}), ToolCall("call_2", "grep", {"pattern": "x"})]),
         Message.tool("call_1", "screenshot", '{"ok": true}', [ContentPart.of_media("image", str(shot))]),
+        Message.tool("call_2", "grep", '{"hits": []}'),
     ]
     p.complete(CompletionRequest(history, tools=TOOLS))
-    parts = opener.last.json()["contents"][2]["parts"]
-    assert "functionResponse" in parts[0] and parts[1]["inlineData"]["mimeType"] == "image/jpeg"
+    contents = opener.last.json()["contents"]
+    assert [c["role"] for c in contents] == ["user", "model", "user", "user"]
+    responses = contents[2]["parts"]
+    assert len(responses) == 2 and all(set(part) == {"functionResponse"} for part in responses)
+    assert [part["functionResponse"]["name"] for part in responses] == ["screenshot", "grep"]
+    media = contents[3]["parts"]
+    assert media[0] == {"text": TOOL_MEDIA_LABEL.format(name="screenshot")} and media[1]["inlineData"]["mimeType"] == "image/jpeg"
+    # a following user message still comes after the media turn, and a result without media adds no media turn
+    opener.queue.append(text_response("ok"))
+    p.complete(CompletionRequest([*history, Message.user("thanks")], tools=TOOLS))
+    assert [c["role"] for c in opener.last.json()["contents"]] == ["user", "model", "user", "user", "user"]
+    opener.queue.append(text_response("ok"))
+    p.complete(CompletionRequest(history[:2] + [Message.tool("call_1", "screenshot", "{}"), history[3]], tools=TOOLS))
+    assert [c["role"] for c in opener.last.json()["contents"]] == ["user", "model", "user"]
+
+
+def test_media_limit_error_tells_the_loop_not_to_compact():
+    big = ContentPart(type="image", path="/nonexistent/big.png", mime="image/png", data_b64="A" * (int(INLINE_MEDIA_LIMIT.value) * 4 // 3 + 8))
+    p, _ = make(FakeOpener())
+    with pytest.raises(ProviderError) as ei:
+        p.complete(CompletionRequest([Message.user("x", [big])]))
+    assert ei.value.category.value == "truncated" and ei.value.error.details["compactable"] is False
+
+
+def test_typeless_tool_parameter_round_trips_as_a_json_string():
+    """A parameter with no type means any JSON value; a string|number|boolean union could never carry an object or a list."""
+    tool = {"type": "function", "function": {"name": "set_value", "description": "d", "parameters": {
+        "type": "object",
+        "properties": {"value": {"description": "Any JSON."}, "name": {"type": "string"}, "items": {"type": "array", "items": {}}},
+        "required": ["value"],
+    }}}
+    decl, paths = function_declaration(tool)
+    props = decl["parameters"]["properties"]
+    assert props["value"] == {"type": "string", "description": "Any JSON." + ANY_JSON_STRING_NOTE}
+    assert props["items"]["items"] == {"type": "string", "description": ANY_JSON_STRING_NOTE.strip()}
+    assert props["name"] == {"type": "string"} and paths == [("value",), ("items", "[]")]
+    decoded = decode_json_strings({"value": '{"a": [1, 2]}', "name": "42", "items": ["[1]", "3.5", "true", "plain prose"]}, paths)
+    assert decoded == {"value": {"a": [1, 2]}, "name": "42", "items": [[1], 3.5, True, "plain prose"]}
+    opener = FakeOpener(calls_response(("set_value", {"value": "[1, {\"b\": 2}]", "name": "n"}, None)))
+    p, _ = make(opener)
+    reply = p.complete(CompletionRequest([Message.user("q")], tools=[tool]))
+    assert reply.tool_calls[0].arguments == {"value": [1, {"b": 2}], "name": "n"}
+    # response schemas have no decode step, so a typeless node there keeps the scalar union Gemini can type
+    assert clean_schema({"properties": {"v": {}}})["properties"]["v"] == ANY_VALUE_SCHEMA
 
 
 def test_json_schema_mode_wins_over_tools():

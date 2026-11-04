@@ -257,7 +257,7 @@ def test_prompts_list_and_get(server: MCPServer):
     assert '- goal: "Bayes for engineers"' in text and '- sources: "notes.pdf, https://example.org/x"' in text
     for tool in ("sources_add", "sources_add_url", "book_outline_propose", "book_unit_brief", "run_checks", "book_mark_done", "book_build"):
         assert tool in text
-    assert text.index("book_outline_propose with") < text.index("book_unit_brief <unit_id>") < text.index("run_checks <unit_id>") < text.index("book_mark_done <unit_id>")
+    assert text.index("book_outline_propose with") < text.index("book_unit_brief with unit_id=<unit_id>") < text.index("run_checks with path=<unit path> and unit_id=<unit_id>") < text.index("book_mark_done with unit_id=<unit_id>")
     assert "study-workflow" in text and "do not repeat the unchanged call" in text and "tools/call" not in text
 
     err = server.handle(req(3, "prompts/get", {"name": "build_book", "arguments": {"persona": "x"}}))["error"]
@@ -452,3 +452,78 @@ def test_prompts_and_instructions_name_tools_the_real_registry_has():
     # Every snake_case word in the rendered prompts is either a tool, a prompt name or the one placeholder.
     words = {w for p, a in samples.items() for w in re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", get_prompt(p, a)["messages"][0]["content"]["text"])}
     assert words - names <= set(PROMPT_NAMES) | {"unit_id"}, sorted(words - names)
+
+
+def test_app_wired_server_lists_only_tools_the_host_context_can_run(workspace, home, provider):
+    """The production wiring (`edgent mcp`): App.tool_context(role='host') has no spawn, no user and no session, so the tools
+    that need them are not advertised, while file tools work under the host's granted 'ask' decisions."""
+    from edgent.application.app import App, AppConfig
+    from edgent.tools.mcp_server import HOST_CONTEXT_TOOLS
+
+    app = App(workspace, AppConfig(provider="mock", home=str(home)), provider=provider)
+    server = MCPServer(app.registry, lambda: app.tool_context(role="host"), page_size=100)
+    (workspace.root / "notes.md").write_text("hello from the workspace\n")
+    stdin = io.StringIO(
+        "\n".join(
+            json.dumps(m)
+            for m in (
+                req(1, "initialize", {"protocolVersion": PROTOCOL_VERSION, "clientInfo": {"name": "claude-code"}, "capabilities": {}}),
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                req(2, "tools/list"),
+                req(3, "tools/call", {"name": "write_file", "arguments": {"path": "book/draft.md", "content": "# Draft\n"}}),
+                req(4, "tools/call", {"name": "read_file", "arguments": {"path": "notes.md"}}),
+                req(5, "tools/call", {"name": "agent", "arguments": {"agent": "librarian", "task": "find x"}}),
+            )
+        )
+        + "\n"
+    )
+    stdout, stderr = io.StringIO(), io.StringIO()
+    assert server.serve(stdin, stdout, stderr) == 0
+    responses = {r["id"]: r for r in (json.loads(line) for line in stdout.getvalue().splitlines())}
+    listed = [t["name"] for t in responses[2]["result"]["tools"]]
+    assert "nextCursor" not in responses[2]["result"]
+    hidden = set(HOST_CONTEXT_TOOLS)
+    assert hidden == {"agent", "ask_user", "todo_write", "todo_read", "session_recall", "remember"} and hidden <= set(app.registry.names())
+    assert not hidden & set(listed) and {"read_file", "write_file", "bash", "run_checks", "book_mark_done", "sources_add"} <= set(listed)
+    assert listed == [n for n in app.registry.names() if n not in hidden] == server.advertised_tool_names()
+    assert f"{len(listed)} tools" in stderr.getvalue()  # the startup line counts what is advertised, not what is registered
+    assert responses[3]["result"]["isError"] is False and (workspace.root / "book" / "draft.md").read_text() == "# Draft\n"  # 'ask' granted by the host
+    assert responses[4]["result"]["isError"] is False and "hello from the workspace" in responses[4]["result"]["structuredContent"]["content"]
+    err = json.loads(responses[5]["result"]["content"][0]["text"])["error"]
+    assert responses[5]["result"]["isError"] is True and err["code"] == "unavailable"  # a hidden tool still answers through the registry
+
+    # A context that can spawn, ask and remember gets the full list: the filter follows the context, not the tool names.
+    def capable() -> ToolContext:
+        ctx = app.tool_context(role="host", ask_user=lambda q: "yes")
+        ctx.spawn = lambda agent, task, **kw: {"summary": "done"}
+        ctx.session = object()
+        return ctx
+
+    full = MCPServer(app.registry, capable, page_size=100).handle(req(6, "tools/list"))["result"]["tools"]
+    assert [t["name"] for t in full] == app.registry.names()
+    assert MCPServer(app.registry, capable).advertised_tool_names() == app.registry.names()
+    # Half-capable: only the tools whose own precondition is met come back.
+    half = MCPServer(app.registry, lambda: app.tool_context(role="host", ask_user=lambda q: "yes")).advertised_tool_names()
+    assert "ask_user" in half and "agent" not in half and "todo_write" not in half
+
+
+def test_build_book_prompt_matches_the_tool_contracts():
+    """The guided steps name run_checks with its required path and send the chapter to the outline unit's path, not <unit_id>.md."""
+    from edgent.tools.checks.registry import build_checks_registry
+    from edgent.tools.core import build_core_registry
+    from edgent.tools.edu.book import build_book_registry
+
+    reg = ToolRegistry()
+    for build in (build_core_registry, build_book_registry, build_checks_registry):
+        build(reg)
+    text = get_prompt("build_book", {"goal": "g", "persona": "p"})["messages"][0]["content"]["text"]
+    steps = [line for line in text.splitlines() if re.match(r"^\d+\. ", line)]
+    assert "book/chapters/<unit_id>.md" not in text and "run_checks <unit_id>" not in text
+    for tool in ("run_checks", "book_unit_brief", "book_mark_done", "write_file"):
+        required = reg.get(tool).parameters.get("required") or []
+        step = next(s for s in steps if f"{tool} with" in s or f"{tool} (" in s)  # the step that calls it, not one that mentions it
+        for arg in required:
+            assert f"{arg}=" in step, f"{tool} needs {arg}; the step does not pass it: {step}"
+    assert reg.get("run_checks").parameters["required"] == ["path"]  # the contract the prompt is held to
+    assert "path=<unit path>" in next(s for s in steps if "run_checks" in s) and "unit_id=<unit_id>" in next(s for s in steps if "run_checks" in s)
+    assert "its brief states the unit's path" in next(s for s in steps if "book_unit_brief" in s)

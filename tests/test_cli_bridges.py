@@ -68,6 +68,26 @@ Options:
   --bare                                Minimal mode: OAuth and keychain are never read
   --dangerously-skip-permissions        Bypass all permission checks
 """
+# claude 2.1.x: --system-prompt-file is only listed as the "[-file]" shorthand inside the --bare description
+CLAUDE_HELP_SHORTHAND = """Usage: claude [options] [command] [prompt]
+Options:
+  --effort <level>                      Effort level (low, medium, high)
+  --model <model>                       Model for the current session
+  --output-format <format>              "text", "json", or "stream-json"
+  -p, --print                           Print response and exit
+  --bare                                Minimal mode: skip hooks (those defined
+                                        in settings and by installed plugins;
+                                        features built into Claude Code are
+                                        unaffected). Explicitly provide context
+                                        via: --system-prompt[-file],
+                                        --append-system-prompt[-file], --add-dir
+                                        (CLAUDE.md dirs), --mcp-config,
+                                        --settings, --agents, --plugin-dir.
+  --system-prompt <prompt>              System prompt to use for the session
+  --system-prompt-snapshot <on|off>     Record the system prompt once per
+                                        session
+  --tools <tools...>                    Specify the list of available tools. Use "" to disable all tools
+"""
 CLAUDE_HELP_OLD = """Usage: claude [options] [command] [prompt]
 Options:
   --allowedTools <tools...>   Comma/space-separated list of tool names to allow
@@ -791,3 +811,47 @@ def test_claude_default_model_and_health(monkeypatch):
     h = p.health()
     assert h["ok"] and h["tool_flag"] == "--tools" and h["effort_flag"] and h["system_prompt_file"] and h["provider"] == "claude-cli"
     assert h["version"] == "2.1.317 (Claude Code)" and "warning" not in h
+
+
+def test_claude_probe_expands_the_system_prompt_file_shorthand():
+    """Current releases list --system-prompt-file only as ``--system-prompt[-file]`` in the --bare text."""
+    assert claude_bridge.expand_flag_shorthand(CLAUDE_HELP_SHORTHAND) == {"--system-prompt", "--system-prompt-file", "--append-system-prompt", "--append-system-prompt-file"}
+    assert claude_bridge.expand_flag_shorthand(CLAUDE_HELP_OLD) == frozenset()
+    assert parse_help_flags(CLAUDE_HELP_SHORTHAND) >= {"--system-prompt", "--system-prompt-snapshot"} and "--system-prompt-file" not in parse_help_flags(CLAUDE_HELP_SHORTHAND)
+    fake = FakeCli(version="2.1.317 (Claude Code)", help_text=CLAUDE_HELP_SHORTHAND)
+    p = ClaudeCliProvider(runner=fake)
+    probe = p.probe()
+    assert probe.has_flag("--system-prompt-file") and probe.has_flag("--append-system-prompt-file") and probe.version == "2.1.317 (Claude Code)"
+    assert [c["argv"][1] for c in fake.calls] == ["--version", "--help", "--help"]  # one extra --help read, once per process
+    p.probe()
+    assert len(fake.calls) == 3
+    assert p.health()["system_prompt_file"] is True
+    # a release that lists the flag plainly, or lacks --system-prompt altogether, is not re-read
+    modern = FakeCli(help_text=CLAUDE_HELP_MODERN)
+    ClaudeCliProvider(runner=modern).probe()
+    assert [c["argv"][1] for c in modern.calls] == ["--version", "--help"]
+    old = FakeCli(help_text=CLAUDE_HELP_OLD)
+    assert not ClaudeCliProvider(runner=old).probe().has_flag("--system-prompt-file") and len(old.calls) == 3
+
+
+def test_claude_large_system_prompt_uses_the_file_flag_found_by_the_shorthand():
+    big = "R" * (claude_bridge.SYSTEM_PROMPT_ARGV_MAX_BYTES + 10)
+    seen: dict[str, Any] = {}
+
+    def completion(argv: list[str], stdin: bytes | None, env: dict[str, str]) -> Completed:
+        path = argv[argv.index("--system-prompt-file") + 1]
+        seen.update(content=Path(path).read_text(encoding="utf-8"), has_inline="--system-prompt" in argv)
+        return Completed(0, claude_envelope("ok"))
+
+    p = ClaudeCliProvider(runner=FakeCli(help_text=CLAUDE_HELP_SHORTHAND, completions=[completion]))
+    assert p.complete(CompletionRequest([Message.system(big), Message.user("q")])).text == "ok"
+    assert seen["content"] == big and not seen["has_inline"]
+
+
+def test_claude_system_prompt_size_error_tells_the_loop_not_to_compact():
+    big = "R" * (claude_bridge.SYSTEM_PROMPT_ARGV_MAX_BYTES + 10)
+    old = ClaudeCliProvider(runner=FakeCli(help_text=CLAUDE_HELP_OLD))
+    with pytest.raises(ProviderError) as ei:
+        old.complete(CompletionRequest([Message.system(big), Message.user("q")]))
+    err = ei.value.error
+    assert err.category.value == "truncated" and err.details["compactable"] is False and err.details["limit"] == claude_bridge.SYSTEM_PROMPT_ARGV_LIMIT.name

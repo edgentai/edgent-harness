@@ -9,8 +9,11 @@ Effort maps to a thinking budget (``thinking_budgets``: tokens per effort level;
 sends no thinking config). Media the model accepts natively (images, audio, video)
 goes inline as base64 under a named 20 MB limit; larger inputs need the Files API,
 which this release does not use. Tool schemas are reduced to the OpenAPI subset
-Gemini accepts; a free-form object parameter (no ``properties``) is advertised as a
-JSON string and decoded again when the model calls the tool. Gemini has no tool
+Gemini accepts; a free-form object parameter (no ``properties``) or a typeless one
+(any JSON value) is advertised as a JSON string and decoded again when the model
+calls the tool. Media attached to a tool result travels on a user turn of its own
+right after the function-response turn, which may hold nothing but function
+responses. Gemini has no tool
 call ids, so this provider mints ``call_...`` ids and remembers name and thought
 signature per id so later turns can be rebuilt faithfully.
 """
@@ -76,9 +79,14 @@ _SCHEMA_KEEP = frozenset(
     }
 )
 JSON_STRING_NOTE = " (a JSON object, encoded as a string)"
+ANY_JSON_STRING_NOTE = " (any JSON value, encoded as a string)"
+TOOL_MEDIA_LABEL = "[attachment from tool {name}]"  # text part that opens the user turn carrying a tool result's media
 # ``format`` is only legal for these values per type; anything else (uri, email, ...) is a 400.
 _FORMATS_BY_TYPE = {"string": ("enum", "date-time"), "number": ("float", "double"), "integer": ("int32", "int64")}
-ANY_VALUE_SCHEMA: dict[str, Any] = {"anyOf": [{"type": "string"}, {"type": "number"}, {"type": "boolean"}]}  # Gemini has no "any"
+# Gemini has no "any": a typeless node in a response schema becomes this union. It cannot include object or array,
+# because Gemini rejects an OBJECT without ``properties`` and an ARRAY without typed ``items``; typeless *tool parameters*
+# are advertised as JSON strings instead (see ``clean_schema``) so the model can still pass objects and lists.
+ANY_VALUE_SCHEMA: dict[str, Any] = {"anyOf": [{"type": "string"}, {"type": "number"}, {"type": "boolean"}]}
 
 GEMINI_CAPS = Capabilities(
     native_tools=True,
@@ -101,7 +109,7 @@ SchemaPath = tuple[str, ...]
 
 # ----------------------------------------------------------------------------- schemas
 def clean_schema(schema: Any, stringify_free_objects: bool = False, _path: SchemaPath = (), _paths: list[SchemaPath] | None = None) -> Any:
-    """Reduce a JSON schema to what Gemini accepts; optionally record free-form objects turned into strings."""
+    """Reduce a JSON schema to what Gemini accepts; optionally record free-form objects and typeless nodes turned into strings."""
     if not isinstance(schema, dict):
         return schema
     out: dict[str, Any] = {}
@@ -124,13 +132,22 @@ def clean_schema(schema: Any, stringify_free_objects: bool = False, _path: Schem
                 out["type"] = v
         elif k in _SCHEMA_KEEP:
             out[k] = v
+    typeless = _is_typeless(out)
     _legalise(out)
-    if out.get("type") == "object" and not out.get("properties") and stringify_free_objects and _path:
-        # Gemini rejects an OBJECT with no properties; advertise a JSON string and decode it on the way back.
+    free_object = out.get("type") == "object" and not out.get("properties")
+    if (free_object or typeless) and stringify_free_objects and _path:
+        # Gemini rejects an OBJECT with no properties and has no "any" type; advertise a JSON string and decode it on
+        # the way back, so the model can still hand over an object or a list.
         if _paths is not None:
             _paths.append(_path)
-        return {"type": "string", "description": (out.get("description") or "").rstrip() + JSON_STRING_NOTE}
+        note = JSON_STRING_NOTE if free_object else ANY_JSON_STRING_NOTE
+        return {"type": "string", "description": ((out.get("description") or "").rstrip() + note).strip()}
     return out
+
+
+def _is_typeless(out: dict[str, Any]) -> bool:
+    """A node that says nothing about its type: any JSON value is meant."""
+    return not any(k in out for k in ("type", "anyOf", "enum", "properties", "items"))
 
 
 def _legalise(out: dict[str, Any]) -> None:
@@ -161,16 +178,18 @@ def _legalise(out: dict[str, Any]) -> None:
 
 
 def decode_json_strings(args: Any, paths: list[SchemaPath]) -> Any:
-    """Undo ``clean_schema``'s string encoding of free-form objects in the arguments the model sent."""
+    """Undo ``clean_schema``'s string encoding of free-form objects and typeless values in the arguments the model sent.
+
+    A string that parses as JSON is replaced by the parsed value; prose that is not JSON stays a string.
+    """
 
     def walk(node: Any, path: SchemaPath) -> Any:
         if not path:
             if isinstance(node, str):
                 try:
-                    parsed = json.loads(node)
+                    return json.loads(node)
                 except ValueError:
                     return node
-                return parsed if isinstance(parsed, (dict, list)) else node
             return node
         seg, rest = path[0], path[1:]
         if seg == "[]":
@@ -233,6 +252,7 @@ class _InlineBudget:
                 self.total,
                 "Send less media: downscale images, trim clips, or attach fewer files in one turn.",
                 ErrorCategory.truncated,
+                compactable=False,  # one turn's media, not the history: compaction cannot help, so the loop must not force it
             )
             raise ProviderError(err.message, retryable=False, category=ErrorCategory.truncated, error=err)
 
@@ -372,18 +392,26 @@ class GeminiProvider(Provider):
         budget = _InlineBudget(INLINE_MEDIA_LIMIT)
         contents: list[dict[str, Any]] = []
         pending_tool_parts: list[dict[str, Any]] = []
+        pending_media_parts: list[dict[str, Any]] = []
 
         def flush_tools() -> None:
+            # the turn after a function call may hold function responses only, one per call; the media those results
+            # attached follows on a user turn of its own
             if pending_tool_parts:
                 contents.append({"role": "user", "parts": list(pending_tool_parts)})
                 pending_tool_parts.clear()
+            if pending_media_parts:
+                contents.append({"role": "user", "parts": list(pending_media_parts)})
+                pending_media_parts.clear()
 
         for m in messages:
             if m.role == "system":
                 continue
             if m.role == "tool":
                 pending_tool_parts.append(self._function_response_part(m))
-                pending_tool_parts.extend(self._inline_part(p, budget) for p in m.media())
+                if m.media():
+                    pending_media_parts.append({"text": TOOL_MEDIA_LABEL.format(name=m.name or "?")})
+                    pending_media_parts.extend(self._inline_part(p, budget) for p in m.media())
                 continue
             flush_tools()
             parts = self._user_or_model_parts(m, budget)

@@ -2,12 +2,16 @@
 
 Standard-library ``http.server``, bound to localhost only, serving the static
 app and a small JSON API over a ``Service`` facade. The facade is what the
-integration layer implements over the agent loop; tests use a fake. Nothing
-here is reachable from outside the machine, and every response carries a
-content-security policy that forbids external scripts.
+integration layer implements over the agent loop; tests use a fake. The server
+binds to loopback only, so the remaining attacker is a web page the user has
+open: state-changing requests must come from our own origin (Origin, Referer
+and Sec-Fetch-Site are checked, a JSON content type is required), the Host
+header must name loopback, and every response carries a content-security
+policy that forbids external scripts.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import mimetypes
 import os
@@ -16,10 +20,23 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
+
+from ...application.sessions import MODES as SESSION_MODES
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 2_000_000  # named limit: request body size
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+JSON_CONTENT_TYPE = "application/json"
+
+
+def _host_port(netloc: str) -> tuple[str, int | None] | None:
+    """(hostname, port) from a Host header or URL netloc; ``[::1]:8765`` -> ("::1", 8765). None when malformed."""
+    try:
+        u = urlsplit("//" + netloc)
+        return (u.hostname or ""), u.port
+    except ValueError:
+        return None
 
 
 class Service(Protocol):
@@ -70,11 +87,30 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(status, {"error": {"code": status, "message": message}})
 
     def _authorised(self) -> bool:
-        host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("127.0.0.1", "localhost", "[::1]", "::1", ""):
+        hp = _host_port(self.headers.get("Host") or "")
+        if hp is None or (hp[0] and hp[0] not in LOOPBACK_HOSTS):
             return False
         if self.token:
-            return self.headers.get("X-Edgent-Token") == self.token or parse_qs(urlparse(self.path).query).get("token", [None])[0] == self.token
+            sent = self.headers.get("X-Edgent-Token") or parse_qs(urlparse(self.path).query).get("token", [""])[0] or ""
+            return hmac.compare_digest(sent.encode("utf-8"), self.token.encode("utf-8"))
+        return True
+
+    def _same_origin(self) -> bool:
+        """Is a state-changing request from our own page? Absent headers (curl, old browsers) pass; another origin does not."""
+        if (self.headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
+            return False
+        own = _host_port(self.headers.get("Host") or "")
+        for name in ("Origin", "Referer"):
+            value = self.headers.get(name)
+            if not value:
+                continue
+            try:
+                u = urlsplit(value)
+                theirs = (u.hostname or ""), u.port
+            except ValueError:  # a malformed header is not our page
+                return False
+            if u.scheme != "http" or theirs[0] not in LOOPBACK_HOSTS or (own is not None and theirs != own):
+                return False
         return True
 
     def _body(self) -> dict[str, Any]:
@@ -84,10 +120,23 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(n) if n else b""
         if not raw:
             return {}
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != JSON_CONTENT_TYPE:
+            raise ValueError(f"Content-Type must be {JSON_CONTENT_TYPE} (got {ctype or 'none'})")
         data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict):
             raise ValueError("body must be a JSON object")
         return data
+
+    @staticmethod
+    def _int(q: dict[str, str], key: str, default: int) -> int:
+        """A non-negative integer query parameter, or a ValueError the caller turns into a 400."""
+        raw = q.get(key)
+        if raw is None or raw == "":
+            return default
+        if not raw.isdigit():
+            raise ValueError(f"query parameter {key!r} must be a non-negative integer (got {raw!r})")
+        return int(raw)
 
     # ------------------------------------------------------------------ routing
     def do_GET(self) -> None:  # noqa: N802
@@ -107,7 +156,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.service.list_sessions())
             if path.startswith("/api/sessions/") and path.endswith("/messages"):
                 sid = path[len("/api/sessions/") : -len("/messages")]
-                return self._json(200, self.service.session_messages(sid, int(q.get("limit", 100))))
+                return self._json(200, self.service.session_messages(sid, self._int(q, "limit", 100)))
             if path == "/api/outline":
                 return self._json(200, self.service.outline())
             if path == "/api/chapters":
@@ -127,8 +176,10 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/doctor":
                 return self._json(200, self.service.doctor())
             if path == "/api/events":
-                return self._json(200, self.service.events(int(q.get("since", 0))))
+                return self._json(200, self.service.events(self._int(q, "since", 0)))
             return self._error(404, "not found")
+        except ValueError as e:
+            return self._error(400, str(e))
         except FileNotFoundError as e:
             return self._error(404, str(e))
         except Exception as e:  # noqa: BLE001
@@ -137,11 +188,16 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorised():
             return self._error(403, "forbidden")
+        if not self._same_origin():
+            return self._error(403, "forbidden: cross-site request; the API accepts state changes only from its own page")
         path = urlparse(self.path).path
         try:
             body = self._body()
             if path == "/api/sessions":
-                return self._json(201, self.service.create_session(str(body.get("mode", "chat")), str(body.get("title", ""))))
+                mode = str(body.get("mode") or "chat")
+                if mode not in SESSION_MODES:
+                    return self._error(400, f"unknown session mode {mode!r}; one of {', '.join(SESSION_MODES)}")
+                return self._json(201, self.service.create_session(mode, str(body.get("title", ""))))
             if path.startswith("/api/sessions/") and path.endswith("/send"):
                 sid = path[len("/api/sessions/") : -len("/send")]
                 text = str(body.get("text", "")).strip()

@@ -389,3 +389,122 @@ def test_non_utf8_skill_files_are_skipped_not_corrupted(workspace, tmp_path):
     assert (dest / "study-workflow" / "references" / "routing.md").is_file()
     rep = doctor("agy", workspace, home=tmp_path / "h", command=CMD, source_dir=skills)
     assert rep["skills_installed"] == ["explaining", "study-workflow"] and rep["skills_stale"] == [] and not any("outdated" in h for h in rep["hints"])
+
+
+def test_setup_never_writes_through_a_symlink_under_the_host_trees(workspace, tmp_path):
+    """A link the model planted under .claude/skills or .claude/agents must not turn setup into a write anywhere else."""
+    skills = make_skills(tmp_path / "builtin_skills")
+    agents = make_agents(tmp_path / "builtin_agents")
+    victim = tmp_path / "victim" / "authorized_keys"
+    victim.parent.mkdir()
+    victim.write_text("ssh-ed25519 AAAA real-key\n")
+    link = workspace.root / ".claude" / "skills" / "study-workflow" / "SKILL.md"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(victim)
+    with pytest.raises(ConfigurationError) as ei:
+        plan_skills("claude", workspace, source_dir=skills, agents_dir=agents)
+    assert "symbolic link" in str(ei.value) and str(link) in str(ei.value) and "Remove the link" in str(ei.value)
+    assert victim.read_text() == "ssh-ed25519 AAAA real-key\n" and not list(victim.parent.glob("*.bak-*"))
+    rep = doctor("claude", workspace, home=tmp_path / "h", command=CMD, source_dir=skills, agents_dir=agents)
+    assert any("symbolic link" in h for h in rep["hints"])  # doctor reports it instead of crashing
+    link.unlink()
+
+    # A linked directory is refused too, for the agent tree.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (workspace.root / ".claude" / "agents").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(ConfigurationError, match="symbolic link"):
+        plan_skills("claude", workspace, source_dir=skills, agents_dir=agents)
+    assert not (elsewhere / "librarian.md").exists()
+    (workspace.root / ".claude" / "agents").unlink()
+
+    # A link planted between the plan and the apply is caught by apply; the config dotfile link keeps working.
+    changes = plan_skills("claude", workspace, source_dir=skills, agents_dir=agents)
+    assert changes and all(c.follow_symlinks is False for c in changes)
+    agent_link = workspace.root / ".claude" / "agents" / "librarian.md"
+    agent_link.parent.mkdir(parents=True)
+    agent_link.symlink_to(victim)
+    with pytest.raises(ConfigurationError, match="symbolic link"):
+        apply(changes)
+    assert victim.read_text() == "ssh-ed25519 AAAA real-key\n" and not list(victim.parent.glob("*.bak-*"))
+    agent_link.unlink()
+    apply(changes)
+    assert agent_link.is_file() and not agent_link.is_symlink()
+    assert Change("x", "create", None, "", "").follow_symlinks is True  # the config change keeps the dotfiles behaviour
+
+
+def test_claude_agents_are_installed_with_the_host_tool_names(workspace, tmp_path):
+    from edgent.application.hosts import CLAUDE_TOOL_NAMES, MCP_TOOL_PREFIX, claude_tool_names, host_agent_text
+    from edgent.application.subagents import AgentDefinition
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    body = "You are the author.\n\nUse `read_file`, then `check_cite`; a ```tool fence stays as is.\n"
+    source = (
+        "---\nname: author\ndescription: Drafts one unit: the brief, the sources, the checks.\n"
+        "tools: read_file, write_file, grep, sources_cite_check, check_cite, run_python, todo_write, todo_read, session_recall, remember, skill, ask_user, agent\n"
+        "effort: high\nskills: [book-authoring, explaining]\nmaxTurns: 60\nbackground: false\n---\n" + body
+    )
+    (agents / "author.md").write_text(source)
+    (agents / "all.md").write_text("---\nname: all\ndescription: Everything.\ntools: *\neffort: low\n---\nBody.\n")
+    (agents / "listed.md").write_text("---\nname: listed\ndescription: Multi-line list.\ntools:\n  - read_file\n  - 'film_look'\ndisallowedTools: bash\n---\nBody.\n")
+    (agents / "bare.md").write_text("No front matter at all.\n")
+    skills = make_skills(tmp_path / "builtin_skills")
+    changes = install_skills("claude", workspace, source_dir=skills, agents_dir=agents)
+    installed = (workspace.root / ".claude" / "agents" / "author.md").read_text()
+    expected_tools = (
+        "tools: Read, mcp__edgent__read_file, Write, mcp__edgent__write_file, Grep, mcp__edgent__grep, mcp__edgent__sources_cite_check, "
+        "mcp__edgent__check_cite, mcp__edgent__run_python, TodoWrite, Skill, mcp__edgent__skill, AskUserQuestion, Task"
+    )
+    assert installed == (
+        "---\nname: author\ndescription: Drafts one unit: the brief, the sources, the checks.\n"
+        f"{expected_tools}\nskills: [book-authoring, explaining]\nmaxTurns: 60\nbackground: false\n---\n" + body
+    )
+    assert "session_recall" not in installed.split("---")[1] and "effort" not in installed and "mcp__edgent__todo" not in installed
+    assert (workspace.root / ".claude" / "agents" / "all.md").read_text() == "---\nname: all\ndescription: Everything.\ntools: *\n---\nBody.\n"
+    assert (workspace.root / ".claude" / "agents" / "listed.md").read_text() == (
+        "---\nname: listed\ndescription: Multi-line list.\ntools: Read, mcp__edgent__read_file, mcp__edgent__film_look\n"
+        "disallowedTools: Bash, mcp__edgent__bash\n---\nBody.\n"
+    )
+    assert (workspace.root / ".claude" / "agents" / "bare.md").read_text() == "No front matter at all.\n"
+    # The rewritten file still parses as an agent definition, and a second install is a noop (the plan compares rewritten text).
+    parsed = AgentDefinition.from_markdown(installed, path=workspace.root / ".claude" / "agents" / "author.md")
+    assert parsed.name == "author" and parsed.tools and parsed.tools[0] == "Read" and parsed.system_prompt == body.strip()
+    assert all(c.action == "noop" for c in install_skills("claude", workspace, source_dir=skills, agents_dir=agents))
+    assert [c.note for c in changes if c.note.startswith("agent a")] == ["agent all: install", "agent author: install"]
+    # Only Claude Code reads agent files; other hosts' text is untouched, as is a file without a closing fence.
+    assert host_agent_text("agy", source) == source and host_agent_text("codex", source) == source
+    assert host_agent_text("claude", "---\nname: x\ntools: read_file\nno closing fence\n") == "---\nname: x\ntools: read_file\nno closing fence\n"
+    assert claude_tool_names(["read_file", "read_file", "list_files", "glob"]) == ["Read", f"{MCP_TOOL_PREFIX}read_file", "Glob", f"{MCP_TOOL_PREFIX}list_files", f"{MCP_TOOL_PREFIX}glob"]
+    assert all(name.startswith("mcp__edgent__") or "_" not in name for names in CLAUDE_TOOL_NAMES.values() for name in names)
+
+
+def test_builtin_agents_rewrite_to_tools_the_mcp_server_serves(workspace):
+    """Every built-in agent, installed for Claude Code, names only host tools or MCP names of tools the registry really has."""
+    from edgent.application.hosts import MCP_TOOL_PREFIX, host_agent_text
+    from edgent.application.subagents import AgentDefinition, builtin_agents_dir
+    from edgent.tools.checks.registry import build_checks_registry
+    from edgent.tools.core import build_core_registry
+    from edgent.tools.edu.assess import build_assess_registry
+    from edgent.tools.edu.book import build_book_registry
+    from edgent.tools.edu.learner import build_learner_registry
+    from edgent.tools.edu.media import build_media_registry
+    from edgent.tools.edu.sources import build_sources_registry
+    from edgent.tools.mcp_server import HOST_CONTEXT_TOOLS
+    from edgent.tools.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    for build in (build_core_registry, build_sources_registry, build_book_registry, build_checks_registry, build_media_registry, build_assess_registry, build_learner_registry):
+        build(reg)
+    served = set(reg.names()) - set(HOST_CONTEXT_TOOLS)
+    files = sorted(Path(builtin_agents_dir()).glob("*.md"))
+    assert len(files) >= 10
+    for f in files:
+        original = AgentDefinition.from_markdown(f.read_text(encoding="utf-8"), path=f)
+        rewritten = AgentDefinition.from_markdown(host_agent_text("claude", f.read_text(encoding="utf-8")), path=f)
+        assert rewritten.system_prompt == original.system_prompt and rewritten.skills == original.skills and rewritten.max_turns == original.max_turns
+        assert original.tools and rewritten.tools, f.name
+        for tool in rewritten.tools:
+            assert tool.startswith(MCP_TOOL_PREFIX) or tool[0].isupper(), (f.name, tool)  # a Claude Code name, never a bare Edgent id
+            if tool.startswith(MCP_TOOL_PREFIX):
+                assert tool[len(MCP_TOOL_PREFIX) :] in served, (f.name, tool)

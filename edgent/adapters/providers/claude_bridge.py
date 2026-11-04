@@ -16,12 +16,19 @@ Measured facts (2026-08, release dependent; flag spellings are probed from
 
 A system prompt is passed on argv, which Linux caps at 128 KiB per element;
 a larger one goes through ``--system-prompt-file`` when the release has it
-and is refused otherwise (never truncated).
+and is refused otherwise (never truncated). Current releases (2.1.x) list that
+flag only as the shorthand ``--system-prompt[-file]`` inside the ``--bare``
+description, which the generic flag scan cannot see, so the probe reads
+``--help`` once more and expands the shorthand when the plain scan found
+``--system-prompt`` but not the file spelling.
 """
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from ...domain.capabilities import Capabilities
@@ -31,11 +38,13 @@ from .base import ProviderError
 from .cli_bridge import (
     DEFAULT_CONCURRENCY,
     DEFAULT_TIMEOUT_S,
+    PROBE_TIMEOUT_S,
     CliBridgeProvider,
     CompletedLike,
     ProbeResult,
     Runner,
     _int,
+    decode_output,
     envelope_text,
     parse_json_envelope,
 )
@@ -47,9 +56,21 @@ TOOL_RESTRICTION_FLAGS: tuple[str, ...] = ("--tools", "--allowedTools")  # prefe
 # sent when the release has them: no transcript on disk, no slash commands, and none of the user's own MCP servers
 # started for every completion (--strict-mcp-config with no --mcp-config loads none). Never --bare: it skips the login.
 OPTIONAL_FLAGS: tuple[str, ...] = ("--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config")
+SYSTEM_PROMPT_FLAG = "--system-prompt"
+SYSTEM_PROMPT_FILE_FLAG = "--system-prompt-file"
+# ``--system-prompt[-file]`` in the help text means both ``--system-prompt`` and ``--system-prompt-file``
+_FLAG_SHORTHAND_RE = re.compile(r"(?<![\w-])(--[a-zA-Z][\w-]*)\[(-[\w-]+)\]")
 SYSTEM_PROMPT_ARGV_MAX_BYTES = 120_000  # bytes: below the 131072-byte kernel ceiling for one argv element
 SYSTEM_PROMPT_ARGV_LIMIT = Limit("claude system prompt argv size", SYSTEM_PROMPT_ARGV_MAX_BYTES, "bytes", does_not_raise=("max_tokens", "the effort level", "the model's context window"))
 DEFAULT_SYSTEM_PROMPT = "You are a careful, direct assistant. Answer the request itself; do not narrate your process."
+
+
+def expand_flag_shorthand(help_text: str) -> frozenset[str]:
+    """Flags written as ``--base[-suffix]`` in the help text, in both spellings."""
+    out: set[str] = set()
+    for base, suffix in _FLAG_SHORTHAND_RE.findall(help_text or ""):
+        out.update((base, base + suffix))
+    return frozenset(out)
 
 
 class ClaudeCliProvider(CliBridgeProvider):
@@ -102,6 +123,18 @@ class ClaudeCliProvider(CliBridgeProvider):
         super().__init__(cli, model or env.get(ENV_MODEL) or DEFAULT_MODEL, runner=runner, timeout_s=timeout_s, concurrency=concurrency, cwd=cwd, env_extra=env_extra, effort_default=effort_default, prices=prices)
 
     # ------------------------------------------------------------------ release-dependent flags
+    def _run_probe(self) -> ProbeResult:
+        probe = super()._run_probe()
+        if not probe.available or probe.has_flag(SYSTEM_PROMPT_FILE_FLAG) or not probe.has_flag(SYSTEM_PROMPT_FLAG):
+            return probe
+        # the generic scan stops at "[": re-read the help once and expand the ``--system-prompt[-file]`` shorthand
+        try:
+            r = self._runner([self.cli, "--help"], None, PROBE_TIMEOUT_S, self.child_env())
+        except (OSError, subprocess.TimeoutExpired):
+            return probe
+        extra = expand_flag_shorthand(decode_output(r.stdout) + "\n" + decode_output(r.stderr))
+        return replace(probe, flags=probe.flags | extra) if extra else probe
+
     def default_env(self) -> dict[str, str]:
         # a completion endpoint must not auto-update or phone home mid-run
         return {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
@@ -133,16 +166,17 @@ class ClaudeCliProvider(CliBridgeProvider):
     def _system_prompt_args(self, system_text: str, probe: ProbeResult, workdir: str | None) -> list[str]:
         size = len(system_text.encode("utf-8"))
         if size <= SYSTEM_PROMPT_ARGV_MAX_BYTES:
-            return ["--system-prompt", system_text]
-        if probe.has_flag("--system-prompt-file") and workdir:
+            return [SYSTEM_PROMPT_FLAG, system_text]
+        if probe.has_flag(SYSTEM_PROMPT_FILE_FLAG) and workdir:
             path = os.path.join(workdir, "system-prompt.md")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(system_text)
-            return ["--system-prompt-file", path]
+            return [SYSTEM_PROMPT_FILE_FLAG, path]
         err = SYSTEM_PROMPT_ARGV_LIMIT.exceeded(
             size,
             "Shorten the system prompt (fewer tools in the catalogue, shorter skills), or update claude to a release with --system-prompt-file.",
             ErrorCategory.truncated,
+            compactable=False,  # the system prompt is not the history: compaction cannot shrink it, so the loop must not force one
         )
         raise ProviderError(err.message, retryable=False, category=ErrorCategory.truncated, error=err)
 
@@ -182,10 +216,21 @@ class ClaudeCliProvider(CliBridgeProvider):
         p = self.probe()
         out["tool_flag"] = self.tool_restriction_flag()
         out["effort_flag"] = p.has_flag("--effort")
-        out["system_prompt_file"] = p.has_flag("--system-prompt-file")
+        out["system_prompt_file"] = p.has_flag(SYSTEM_PROMPT_FILE_FLAG)
         if p.available and out["tool_flag"] is None:
             out["warning"] = "no flag to switch the CLI's tools off; completions may run the CLI's own tools"
         return out
 
 
-__all__ = ["DEFAULT_MODEL", "DEFAULT_SYSTEM_PROMPT", "ENV_MODEL", "OPTIONAL_FLAGS", "SYSTEM_PROMPT_ARGV_MAX_BYTES", "TOOL_RESTRICTION_FLAGS", "ClaudeCliProvider"]
+__all__ = [
+    "DEFAULT_MODEL",
+    "DEFAULT_SYSTEM_PROMPT",
+    "ENV_MODEL",
+    "OPTIONAL_FLAGS",
+    "SYSTEM_PROMPT_ARGV_MAX_BYTES",
+    "SYSTEM_PROMPT_FILE_FLAG",
+    "SYSTEM_PROMPT_FLAG",
+    "TOOL_RESTRICTION_FLAGS",
+    "ClaudeCliProvider",
+    "expand_flag_shorthand",
+]

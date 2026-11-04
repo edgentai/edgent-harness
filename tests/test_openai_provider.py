@@ -9,7 +9,14 @@ import pytest
 
 from edgent.adapters.providers.base import ProviderError
 from edgent.adapters.providers.http import HttpRequest, HttpResponse
-from edgent.adapters.providers.openai_compat import OpenAICompatProvider, split_think
+from edgent.adapters.providers.openai_compat import (
+    DEFAULT_BASE_URL,
+    OpenAICompatProvider,
+    hosted_by_openai,
+    is_reasoning_model,
+    reasoning_defaults,
+    split_think,
+)
 from edgent.domain.capabilities import Capabilities
 from edgent.domain.errors import ConfigurationError
 from edgent.domain.types import CompletionRequest, ContentPart, Message, ToolCall
@@ -286,3 +293,68 @@ def test_base_url_needs_a_scheme():
     with pytest.raises(ConfigurationError, match="http://"):
         OpenAICompatProvider("localhost:8000/v1", "m")
     assert OpenAICompatProvider("HTTP://localhost:8000/v1/", "m").base_url == "HTTP://localhost:8000/v1"
+
+
+def test_parallel_tool_results_stay_adjacent_and_share_one_attachment_turn(tmp_path: Path):
+    """Every tool message must directly follow the assistant's tool_calls message; media waits until the run ends."""
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    a.write_bytes(b"\x89PNG\r\n\x1a\nA")
+    b.write_bytes(b"\x89PNG\r\n\x1a\nB")
+    opener = FakeOpener(chat("x"), chat("x"))
+    p, _ = make(opener)
+    history = [
+        Message.user("q"),
+        Message.assistant("", [ToolCall("c1", "screenshot", {}), ToolCall("c2", "grep", {"pattern": "z"}), ToolCall("c3", "render", {})]),
+        Message.tool("c1", "screenshot", "{}", [ContentPart.of_media("image", str(a))]),
+        Message.tool("c2", "grep", '{"hits": 0}'),
+        Message.tool("c3", "render", "{}", [ContentPart.of_media("image", str(b))]),
+        Message.user("and now?"),
+    ]
+    p.complete(CompletionRequest(history, tools=TOOLS))
+    msgs = opener.last.json()["messages"]
+    assert [(m["role"], m.get("tool_call_id")) for m in msgs] == [("user", None), ("assistant", None), ("tool", "c1"), ("tool", "c2"), ("tool", "c3"), ("user", None), ("user", None)]
+    attachments = msgs[5]["content"]
+    assert [c["type"] for c in attachments] == ["text", "image_url", "text", "image_url"]
+    assert attachments[0]["text"] == "[attachment from tool screenshot]" and attachments[2]["text"] == "[attachment from tool render]"
+    assert msgs[6] == {"role": "user", "content": "and now?"}
+    # media on the last message of the history is still flushed
+    p.complete(CompletionRequest(history[:-1], tools=TOOLS))
+    assert [m["role"] for m in opener.last.json()["messages"]][-2:] == ["tool", "user"]
+
+
+def test_openai_hosted_and_reasoning_models_get_the_parameters_they_accept():
+    assert is_reasoning_model("gpt-5") and is_reasoning_model("o3-mini") and is_reasoning_model("GPT-5.1-codex") and not is_reasoning_model("gpt-4o")
+    assert hosted_by_openai(DEFAULT_BASE_URL) and not hosted_by_openai(BASE) and not hosted_by_openai("not a url")
+    assert reasoning_defaults(BASE, "qwen3") == {}
+    opener = FakeOpener(chat("x"), chat("x"), chat("x"), chat("x"))
+    hosted_reasoning = OpenAICompatProvider(DEFAULT_BASE_URL, "gpt-5", api_key=KEY, opener=opener)
+    hosted_reasoning.complete(CompletionRequest([Message.user("q")], max_tokens=77, temperature=0.2))
+    body = opener.last.json()
+    assert body["max_completion_tokens"] == 77 and "max_tokens" not in body and "temperature" not in body and body["reasoning_effort"] == "medium"
+    hosted_plain = OpenAICompatProvider(DEFAULT_BASE_URL, "gpt-4o", api_key=KEY, opener=opener)
+    hosted_plain.complete(CompletionRequest([Message.user("q")], max_tokens=77, temperature=0.2))
+    body = opener.last.json()
+    assert body["max_completion_tokens"] == 77 and body["temperature"] == 0.2 and "reasoning_effort" not in body
+    local_reasoning = OpenAICompatProvider(BASE, "o4-mini", api_key=KEY, opener=opener)  # a proxy serving the o-series
+    local_reasoning.complete(CompletionRequest([Message.user("q")]))
+    assert "max_completion_tokens" in opener.last.json() and "temperature" not in opener.last.json()
+    local_plain, _ = make(opener)
+    local_plain.complete(CompletionRequest([Message.user("q")], temperature=0.2))
+    assert opener.last.json()["max_tokens"] == 4096 and opener.last.json()["temperature"] == 0.2
+    # an explicit setting wins over the model-based default
+    forced = OpenAICompatProvider(DEFAULT_BASE_URL, "gpt-5", api_key=KEY, opener=opener, reasoning_effort_param=False, max_tokens_param="max_tokens")
+    assert not forced.reasoning_effort_param and forced.max_tokens_param == "max_tokens"
+
+
+def test_unsupported_parameter_400_names_the_switches():
+    body = json.dumps({"error": {"message": "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.", "type": "invalid_request_error"}})
+    opener = FakeOpener(HttpResponse(400, body.encode()), HttpResponse(400, json.dumps({"error": {"message": "model not found"}}).encode()))
+    p, _ = make(opener)
+    with pytest.raises(ProviderError) as ei:
+        p.complete(CompletionRequest([Message.user("q")]))
+    e = ei.value
+    assert e.status == 400 and "reasoning_effort_param" in e.error.remediation and "max_completion_tokens" in e.error.remediation
+    assert "max_tokens and temperature" in e.error.remediation
+    with pytest.raises(ProviderError) as ei2:  # a 400 about something else keeps the plain remediation
+        p.complete(CompletionRequest([Message.user("q")]))
+    assert "reasoning_effort_param" not in ei2.value.error.remediation

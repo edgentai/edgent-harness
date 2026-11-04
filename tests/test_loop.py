@@ -340,7 +340,9 @@ def test_compaction_triggers_under_pressure_and_transcript_is_complete(workspace
     assert result.stop_reason == "done" and result.text.startswith("Summary:") and result.tool_calls == 6
     s = loop.session
     assert s.notes and all(n["level"] == 0 for n in s.notes) and len(s.messages) < 14
-    assert any(m.meta.get("cleared") for m in Session.load(workspace, "s1").messages) or len(s.messages) <= 6
+    reloaded = Session.load(workspace, "s1").messages
+    assert len(reloaded) < 14 and any(m.meta.get("cleared") for m in reloaded) == any(m.meta.get("cleared") for m in s.messages)  # the compacted view is what was persisted
+    assert sum(1 for m in s.messages if m.role == "tool") < 6  # old tool results left the live context
     assert len(s.transcript_path.read_text().splitlines()) == 14  # user + 6 x (assistant, tool) + final assistant
     assert any(e.kind == "compaction" and e.data["reason"] == "context pressure" for e in TraceReader(loop.tracer.path))
     assert any(e["type"] == "compaction" for e in events)

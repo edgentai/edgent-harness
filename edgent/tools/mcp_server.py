@@ -15,6 +15,11 @@ is not an object (-32600), a missing ``name`` or a bad cursor (-32602), an
 unknown method (-32601). An unknown tool name goes through the registry too,
 so the model gets the list of available tools in the remediation.
 
+``tools/list`` advertises only what the host's context can run: a tool that
+needs the loop (``agent``), a person (``ask_user``) or Edgent's own session
+(``todo_*``, ``session_recall``, ``remember``) is left out when the context
+has no ``spawn``, ``ask_user`` or ``session`` (``HOST_CONTEXT_TOOLS``).
+
 Permissions: a stdio server has no prompt of its own, and the host asks its
 user before every ``tools/call`` it forwards. So when the tool context has
 no ``ask_permission`` callback, an ``ask`` decision is granted (the host
@@ -47,6 +52,17 @@ MEDIA_ATTACHMENT_LIMIT = Limit("MCP inline media size", 4 * 1024 * 1024, "bytes"
 ERROR_MESSAGE_MAX_CHARS = 600
 CURSOR_PREFIX = "tools:"
 _LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+# Tools whose precondition is a ToolContext attribute a host context usually lacks: the loop's spawn callback, an
+# interactive user, or Edgent's own session. A context without the attribute cannot run them, so tools/list hides them
+# instead of offering the host's model a tool that only ever answers "unavailable". tools/call still reaches the registry.
+HOST_CONTEXT_TOOLS: dict[str, str] = {
+    "agent": "spawn",
+    "ask_user": "ask_user",
+    "todo_write": "session",
+    "todo_read": "session",
+    "session_recall": "session",
+    "remember": "session",
+}
 
 # JSON-RPC 2.0 error codes.
 PARSE_ERROR = -32700
@@ -281,8 +297,14 @@ class MCPServer:
     def _ping(params: dict[str, Any]) -> dict[str, Any]:
         return {}
 
+    def advertised_tool_names(self, ctx: ToolContext | None = None) -> list[str]:
+        """The registry's tools minus those whose precondition (spawn, an interactive user, a session) ``ctx`` cannot meet."""
+        ctx = self.ctx_factory() if ctx is None else ctx
+        hidden = {name for name, attr in HOST_CONTEXT_TOOLS.items() if getattr(ctx, attr, None) is None}
+        return [n for n in self.registry.names() if n not in hidden]
+
     def _tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
-        tools = self.registry.mcp_manifest(compact=self.schema_profile != "full")["tools"]
+        tools = self.registry.mcp_manifest(compact=self.schema_profile != "full", allowlist=set(self.advertised_tool_names()))["tools"]
         offset = self._parse_cursor(params.get("cursor"))
         if offset > len(tools):
             raise RpcError(INVALID_PARAMS, f"cursor is past the end of the tool list ({len(tools)} tools); call tools/list without a cursor")
@@ -368,7 +390,10 @@ class MCPServer:
         for stream, errors in ((stdin, "replace"), (stdout, "strict")):
             with contextlib.suppress(Exception):
                 stream.reconfigure(encoding="utf-8", errors=errors)  # type: ignore[union-attr]
-        self._log(stderr, f"{self.server_name} mcp: {len(self.registry.names())} tools, {len(self.prompts)} prompts, schema profile {self.schema_profile}")
+        count = len(self.registry.names())
+        with contextlib.suppress(Exception):  # a context the host cannot build yet is reported on the first call, not here
+            count = len(self.advertised_tool_names())
+        self._log(stderr, f"{self.server_name} mcp: {count} tools, {len(self.prompts)} prompts, schema profile {self.schema_profile}")
         with contextlib.redirect_stdout(stderr):
             while self.serve_once(stdin, stdout, stderr):
                 pass
@@ -392,6 +417,7 @@ class MCPServer:
 
 __all__ = [
     "DEFAULT_INSTRUCTIONS",
+    "HOST_CONTEXT_TOOLS",
     "INTERNAL_ERROR",
     "INVALID_PARAMS",
     "INVALID_REQUEST",

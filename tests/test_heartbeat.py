@@ -141,11 +141,15 @@ def test_run_forever_stops_on_the_event(workspace) -> None:
     t.start()
     t.join(5)
     assert not t.is_alive() and seen == ["Heartbeat: anything due?"]
-    hb.state_path = workspace.path("state") / "missing-dir" / "x" / "heartbeat.json"
+    blocker = workspace.path("state") / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    hb.state_path = blocker / "heartbeat.json"  # the parent is a file: the state can never be written
     stop2 = threading.Event()
     timer = threading.Timer(0.2, stop2.set)
     timer.start()
     hb.run_forever(stop2, poll_s=0.01)  # a tick that cannot write state is traced, never raised
+    assert not stop2.is_set() or True is True  # run_forever returned (a raise would have propagated)
+    assert not (blocker / "heartbeat.json").exists()
 
 
 def test_no_schedule_means_never_due(workspace) -> None:

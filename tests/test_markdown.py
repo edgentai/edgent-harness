@@ -52,3 +52,14 @@ def test_markdown_to_html():
     assert 'class="placeholder placeholder-film" data-kind="film" data-id="f1"' in body
     assert "<hr>" in body and "&lt;script&gt;" in body and "<script>" not in body
     assert page("T", body).startswith("<!doctype html>") and "</section>" in body
+
+
+def test_attribute_values_are_escaped_and_schemes_filtered():
+    body, _ = markdown_to_html('![x](x"onerror="alert(1)) and [a](http://x/?q="1") and ![alt "q"](i.png)')
+    assert 'src="x&quot;onerror=&quot;alert(1"' in body and 'onerror="' not in body
+    assert '<a href="http://x/?q=&quot;1&quot;">a</a>' in body and 'alt="alt &quot;q&quot;"' in body
+    body, _ = markdown_to_html("[j](javascript:alert(1)) [v](vbscript:x) [d](data:text/html,hi) ![s](javascript:alert(1))")
+    assert body.count('href="#"') == 3 and 'src="#"' in body and "javascript:" not in body
+    body, _ = markdown_to_html("[r](../ch/02.md#sec) [m](mailto:a@b.c) [h](https://x/y) ![p](data:image/png;base64,AAAA) ![q](./fig.svg)")
+    assert 'href="../ch/02.md#sec"' in body and 'href="mailto:a@b.c"' in body and 'href="https://x/y"' in body
+    assert 'src="data:image/png;base64,AAAA"' in body and 'src="./fig.svg"' in body

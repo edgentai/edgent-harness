@@ -141,11 +141,13 @@ def _render_build_book(args: dict[str, str]) -> str:
             "a source whose coverage is 'unknown' may be silent on a topic without lacking it, and the text must say so.",
             "Outline: book_outline_propose with the goal and the persona. Show the proposal to the user and adjust it before writing: "
             "the outline is the feature list, and unit statuses move only through book_mark_done.",
-            "For each unit in outline order: book_unit_brief <unit_id>, then author the chapter into book/chapters/<unit_id>.md with "
-            "write_file, following the book-authoring skill (motivation before definition, worked examples, one idea per section, "
-            "every claim cited as source-id:p.N or source-id:t=HH:MM:SS).",
-            "run_checks <unit_id> (render, cite, execute, readability); fix what fails and re-run until clean. Never edit a status by hand.",
-            "book_mark_done <unit_id>: it runs the checks again and refuses to move the status on a failure; an obligation that cannot be "
+            "For each unit in outline order: book_unit_brief with unit_id=<unit_id>; its brief states the unit's path (the outline "
+            "sets it, e.g. book/chapters/01-vectors.md; never invent another). Author the chapter at exactly that path with write_file "
+            "(path=<unit path>, content=<the chapter>), following the book-authoring skill (motivation before definition, worked "
+            "examples, one idea per section, every claim cited as source-id:p.N or source-id:t=HH:MM:SS).",
+            "run_checks with path=<unit path> and unit_id=<unit_id> (render, cite, execute, readability); fix what fails and re-run "
+            "until clean. Never edit a status by hand.",
+            "book_mark_done with unit_id=<unit_id>: it runs the checks again and refuses to move the status on a failure; an obligation that cannot be "
             "closed becomes an unknown and the unit stays partial. Append one line to progress.md saying what was done and what is open.",
             "After the last unit run the audit_unknowns workflow, then book_build for HTML, PDF or EPUB.",
         ],

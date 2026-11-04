@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import subprocess
 import threading
 import zipfile
 from dataclasses import dataclass, field
@@ -629,18 +628,28 @@ class CommandResult:
         return self.returncode == 0 and not self.timed_out
 
 
+COMMAND_MEMORY_BYTES = 2 << 30  # memory ceiling for a toolchain run on an untrusted file (bytes): ffmpeg and pandoc on large inputs
+COMMAND_PASSTHROUGH_ENV = ("TESSDATA_PREFIX", "FONTCONFIG_PATH", "LANG", "LC_ALL")  # what the toolchains need from the environment
+
+
 def run_command(argv: list[str], timeout_s: float, cwd: str | os.PathLike[str] | None = None) -> CommandResult:
-    """Run a toolchain binary with a wall-clock limit; a missing binary is exit 127, never an exception."""
+    """Run a toolchain binary on untrusted bytes inside the sandbox: wall-clock and CPU limits, a memory ceiling, no
+    network, a scrubbed environment. A missing binary is exit 127, never an exception."""
+    from ..sandbox.runner import run_subprocess
+
+    env_extra = {k: os.environ[k] for k in COMMAND_PASSTHROUGH_ENV if k in os.environ}
     try:
-        r = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=timeout_s, stdin=subprocess.DEVNULL, check=False)
-    except FileNotFoundError as e:
-        return CommandResult(127, b"", f"executable not found: {e}")
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout if isinstance(e.stdout, bytes) else b""
-        err = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else ""
-        return CommandResult(-9, out, err + f"\n[timed out after {timeout_s:g} s]", timed_out=True)
-    except OSError as e:
+        r = run_subprocess(
+            argv,
+            cwd=str(cwd) if cwd is not None else os.getcwd(),
+            timeout_s=timeout_s,
+            cpu_seconds=max(1, int(timeout_s)),
+            memory_bytes=COMMAND_MEMORY_BYTES,
+            allow_network=False,
+            env_extra=env_extra,
+            max_output=int(COMMAND_OUTPUT_BYTES_LIMIT.value),
+        )
+    except OSError as e:  # the sandbox reports a missing or refused executable as exit 127/126; this is the runner itself failing
         return CommandResult(126, b"", str(e))
-    if len(r.stdout) > COMMAND_OUTPUT_BYTES_LIMIT.value:
-        return CommandResult(r.returncode, r.stdout[: int(COMMAND_OUTPUT_BYTES_LIMIT.value)], r.stderr.decode("utf-8", "replace") + "\n[stdout truncated]")
-    return CommandResult(r.returncode, r.stdout, r.stderr.decode("utf-8", "replace"))
+    stderr = r.stderr + (f"\n[timed out after {timeout_s:g} s]" if r.timed_out else "") + ("\n[stdout truncated]" if r.truncated else "")
+    return CommandResult(-9 if r.timed_out else r.returncode, r.stdout.encode("utf-8", "replace"), stderr, timed_out=r.timed_out)

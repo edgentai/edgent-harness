@@ -46,6 +46,7 @@ GREP_CONTEXT_MAX_LINES = 5
 BASH_TIMEOUT_LIMIT = Limit("bash timeout", 600, "s", does_not_raise=("the registry timeout, which follows it",))
 PYTHON_TIMEOUT_LIMIT = Limit("run_python timeout", 600, "s")
 SANDBOX_OUTPUT_CHARS = 20_000
+BASH_HOME_REL = ".edgent/home"  # HOME and TMPDIR of a bash call: harness-owned, gitignored, never the workspace root
 DEFAULT_SANDBOX_MEMORY_MB = 1024
 REGISTRY_TIMEOUT_MARGIN_S = 30.0  # the registry's own timeout sits above the sandbox's so the sandbox reports first
 WEB_FETCH_DEFAULT_CHARS = 20_000
@@ -453,13 +454,17 @@ def bash(ctx: ToolContext, a: dict[str, Any]) -> dict[str, Any]:
     timeout_s = float(_clamp(a.get("timeout_s", 60), BASH_TIMEOUT_LIMIT, 1))
     cpu_seconds, memory_bytes = _sandbox_limits(ctx, timeout_s)
     allow_network = bool(a.get("allow_network", False))
+    # A non-login shell without rc files: a .bash_profile or .bashrc shipped inside a workspace is data, not code
+    # that runs on every call. HOME points at a harness-owned directory, so a workspace .gitconfig is not git's either.
+    home = ensure_dir(ctx.workspace.root / BASH_HOME_REL)
     r = run_subprocess(
-        ["bash", "-lc", command],
+        ["bash", "--noprofile", "--norc", "-c", command],
         cwd=str(ctx.workspace.root),
         timeout_s=timeout_s,
         cpu_seconds=cpu_seconds,
         memory_bytes=memory_bytes,
         allow_network=allow_network,
+        env_extra={"HOME": str(home), "TMPDIR": str(home)},
         max_output=SANDBOX_OUTPUT_CHARS,
     )
     return _sandbox_dict(r, timeout_s, BASH_TIMEOUT_LIMIT, allow_network)
@@ -803,12 +808,13 @@ def core_specs() -> list[ToolSpec]:
             "bash", bash,
             "Run a shell command in the sandbox with the workspace as the working directory: git, tests, build "
             "steps, ffmpeg, pandoc, data wrangling, anything the other tools cannot do. State the command's effect "
-            "in your reply. The process has CPU, memory and output limits, a scrubbed environment and no network "
-            "unless allow_network is set and the policy permits it. Non-zero exit codes are returned, not raised.",
+            "in your reply. The process has CPU, memory and output limits, a scrubbed environment (HOME is a "
+            f"harness-owned {BASH_HOME_REL}, not the workspace) and no network unless allow_network is set and the "
+            "policy permits it. Non-zero exit codes are returned, not raised.",
             obj({
-                "command": opt(S, "The command line, run with bash -lc."),
+                "command": opt(S, "The command line, run with bash -c as a non-login shell: no .bash_profile, .profile or .bashrc is sourced, so set what you need in the command itself."),
                 "timeout_s": opt(I, f"Wall-clock limit in seconds (default 60, capped at {BASH_TIMEOUT_LIMIT.value:g}).", minimum=1),
-                "allow_network": opt(B, "Let the command reach the network (default false: the sandbox blocks it where the OS allows). The permission policy may ask or deny."),
+                "allow_network": opt(B, "Let the command reach the network (default false: the sandbox blocks it where the OS allows). A call with allow_network=true is judged by the permission policy as a network request, like web_fetch, so it may be asked about or denied even though bash is otherwise a compute tool."),
             }, ["command"]),
             permission="compute",
             when_not_to_use="a dedicated tool does it better: read_file, edit_file, grep and glob for files; web_fetch for pages; run_python for a Python snippet.",
