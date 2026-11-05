@@ -1,0 +1,10 @@
+# Environment variables / secret keys
+.env
+.env.*
+
+# Python bytecode and build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
