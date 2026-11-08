@@ -1,47 +1,34 @@
 import subprocess
-import os
-from typing import Dict, Any
+import shlex
 
-# Safety block: list commands that Edgent is strictly prohibited from running
-DISALLOWED_COMMANDS = [
-    "rmdir /s", "del /f", "format", "shutdown", "reboot"
-]
+PROHIBITED_COMMANDS = ["rm -rf /", "mkfs", "dd", "format", "shutdown", "reboot"]
 
-def run_cmd(command: str, cwd: str = ".") -> str:
-    """Executes a shell command in the specified directory and returns the combined stdout/stderr output.
+def run_cmd(command: str, timeout: int = 30) -> str:
+    """Executes a shell command safely with execution timeouts.
     
     Args:
-        command: The shell command to execute (e.g., 'python -m pytest', 'git status').
-        cwd: The directory to run the command in (defaults to current working directory).
+        command: The terminal command to execute.
+        timeout: Maximum execution time in seconds (default 30s).
     """
-    # Safety check
-    cmd_lower = command.lower()
-    for forbidden in DISALLOWED_COMMANDS:
-        if forbidden in cmd_lower:
-            return f"Error: Command '{command}' blocked for safety reasons."
+    for forbidden in PROHIBITED_COMMANDS:
+        if forbidden in command.lower():
+            return f"Error: Command '{command}' blocked by safety guardrails."
 
     try:
         result = subprocess.run(
             command,
             shell=True,
-            cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=30  # Safety timeout (30 seconds)
+            timeout=timeout
         )
-        
-        output = []
-        if result.stdout:
-            output.append(f"[stdout]:\n{result.stdout.strip()}")
+        output = result.stdout
         if result.stderr:
-            output.append(f"[stderr]:\n{result.stderr.strip()}")
-            
-        if not output:
-            return f"Command executed with return code {result.returncode} (No output)."
-            
-        return "\n".join(output)
-
+            output += f"\n[STDERR]\n{result.stderr}"
+        
+        return output.strip() if output.strip() else "Command executed with no output."
+    
     except subprocess.TimeoutExpired:
-        return f"Error: Command '{command}' timed out after 30 seconds."
+        return f"Error: Command '{command}' timed out after {timeout} seconds."
     except Exception as e:
-        return f"Error executing command: {str(e)}"
+        return f"Execution Error: {e}"
