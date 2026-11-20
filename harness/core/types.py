@@ -95,6 +95,17 @@ class ContentPart(_Serialisable):
     def of_text(text: str, untrusted: bool = False) -> "ContentPart":
         return ContentPart(type="text", text=text, untrusted=untrusted)
 
+    @staticmethod
+    def of_image(
+        data_url: str,
+        mime: str = "image/png",
+        *,
+        text: Optional[str] = None,
+        artifact_id: Optional[str] = None,
+        untrusted: bool = True,
+    ) -> "ContentPart":
+        return ContentPart(type="image", data_url=data_url, mime=mime, text=text, artifact_id=artifact_id, untrusted=untrusted)
+
 
 @dataclass
 class ToolCall(_Serialisable):
@@ -111,6 +122,8 @@ class ToolError(_Serialisable):
     message: str
     retryable: bool = False
     details: dict[str, Any] = field(default_factory=dict)
+    category: str = ""  # canonical error algebra category (invalid_input, truncated, timeout, unavailable, ...)
+    remediation: str = ""  # bounded next step; never repeat the unchanged call
 
 
 @dataclass

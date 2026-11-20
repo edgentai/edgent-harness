@@ -87,6 +87,7 @@ class SandboxConfig:
     memory_bytes: int = 1 << 30
     timeout_s: float = 60.0
     allow_network: bool = False
+    python_executable: str = ""  # override (e.g. .venv-code/bin/python with matplotlib/sklearn/torch)
     allowed_executables: tuple[str, ...] = ("python3", "ffmpeg", "ffprobe", "tesseract")
 
 

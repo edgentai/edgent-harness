@@ -82,13 +82,43 @@ class ModelResponse:
         )
 
 
+@dataclass
+class StreamEvent:
+    """Typed streaming event emitted during model generation and tool execution."""
+
+    kind: str  # text_delta | thinking_delta | tool_call_start | tool_call_delta | tool_start | tool_end | turn_start | status | done | error
+    text: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"kind": self.kind}
+        if self.text:
+            out["text"] = self.text
+        if self.data:
+            out["data"] = self.data
+        return out
+
+
+StreamCallback = Callable[[StreamEvent], None]
+
+
 class ModelClient:
-    """Interface. Subclasses implement ``complete``."""
+    """Interface. Subclasses implement ``complete`` (and optionally ``complete_stream``)."""
 
     name = "base"
 
     def complete(self, request: ModelRequest) -> ModelResponse:  # pragma: no cover - interface
         raise NotImplementedError
+
+    def complete_stream(self, request: ModelRequest, on_event: Optional[StreamCallback] = None) -> ModelResponse:
+        resp = self.complete(request)
+        if on_event is not None:
+            if resp.reasoning:
+                on_event(StreamEvent("thinking_delta", text=resp.reasoning))
+            if resp.text:
+                on_event(StreamEvent("text_delta", text=resp.text))
+            on_event(StreamEvent("done", data={"finish_reason": resp.finish_reason, "usage": resp.usage.to_dict()}))
+        return resp
 
     def health(self) -> dict[str, Any]:
         return {"ok": True, "backend": self.name}
@@ -253,12 +283,7 @@ class OpenAICompatibleClient(ModelClient):
             cost_usd=(pt * self.price_prompt + ct * self.price_completion) / 1e6,
         )
 
-    def complete(self, req: ModelRequest) -> ModelResponse:
-        request_id = self.ids.new("req")
-        payload = self.build_payload(req)
-        t0 = time.monotonic()
-        raw = self._post("/chat/completions", payload, request_id)
-        latency = time.monotonic() - t0
+    def _parse_response(self, raw: dict[str, Any], request_id: str, latency: float) -> ModelResponse:
         choices = raw.get("choices") or []
         if not choices:
             raise ModelError("empty choices in response")
@@ -289,6 +314,156 @@ class OpenAICompatibleClient(ModelClient):
             model=raw.get("model", self.model),
             raw=raw,
         )
+
+    def complete(self, req: ModelRequest) -> ModelResponse:
+        request_id = self.ids.new("req")
+        payload = self.build_payload(req)
+        t0 = time.monotonic()
+        raw = self._post("/chat/completions", payload, request_id)
+        return self._parse_response(raw, request_id, time.monotonic() - t0)
+
+    def complete_stream(self, req: ModelRequest, on_event: Optional[StreamCallback] = None) -> ModelResponse:
+        """Stream SSE chunks from ``/chat/completions`` (with non-SSE JSON fallback)."""
+        request_id = self.ids.new("req")
+        payload = self.build_payload(req)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "X-Request-Id": request_id,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        http_req = urllib.request.Request(self.base_url + "/chat/completions", data=data, headers=headers, method="POST")
+
+        t0 = time.monotonic()
+        delay = 1.0
+        last: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with self._open(http_req, timeout=self.timeout_s) as resp:
+                    text_parts: list[str] = []
+                    reasoning_parts: list[str] = []
+                    tc_acc: dict[int, dict[str, Any]] = {}
+                    usage_raw: dict[str, Any] = {}
+                    finish_reason = "stop"
+                    model_name = self.model
+                    buffered_json: list[str] = []
+                    saw_sse = False
+
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", "replace") if isinstance(raw_line, (bytes, bytearray)) else str(raw_line)
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith(":"):
+                            continue
+                        if not saw_sse and stripped.startswith("{"):
+                            buffered_json.append(stripped)
+                            continue
+                        if buffered_json:
+                            buffered_json.append(stripped)
+                            continue
+                        if not stripped.startswith("data:"):
+                            continue
+                        saw_sse = True
+                        body = stripped[5:].strip()
+                        if body == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(body)
+                        except json.JSONDecodeError:
+                            continue
+                        if chunk.get("model"):
+                            model_name = str(chunk["model"])
+                        if chunk.get("usage"):
+                            usage_raw = {"usage": chunk["usage"]}
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        ch = choices[0]
+                        if ch.get("finish_reason"):
+                            finish_reason = str(ch["finish_reason"])
+                        delta = ch.get("delta") or {}
+                        r_chunk = delta.get("reasoning_content") or delta.get("reasoning")
+                        if r_chunk:
+                            reasoning_parts.append(str(r_chunk))
+                            if on_event:
+                                on_event(StreamEvent("thinking_delta", text=str(r_chunk)))
+                        c_chunk = delta.get("content")
+                        if c_chunk:
+                            text_parts.append(str(c_chunk))
+                            if on_event:
+                                on_event(StreamEvent("text_delta", text=str(c_chunk)))
+                        for tc in delta.get("tool_calls") or []:
+                            idx = int(tc.get("index", 0))
+                            entry = tc_acc.setdefault(idx, {"id": "", "name": "", "args": []})
+                            if tc.get("id"):
+                                entry["id"] = str(tc["id"])
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                first_name = not entry["name"]
+                                entry["name"] += str(fn["name"])
+                                if first_name and on_event:
+                                    on_event(StreamEvent("tool_call_start", data={"name": entry["name"], "id": entry["id"]}))
+                            if fn.get("arguments"):
+                                entry["args"].append(str(fn["arguments"]))
+                                if on_event:
+                                    on_event(StreamEvent("tool_call_delta", text=str(fn["arguments"]), data={"index": idx}))
+
+                    latency = time.monotonic() - t0
+                    if buffered_json and not saw_sse:
+                        raw = json.loads("\n".join(buffered_json))
+                        parsed_resp = self._parse_response(raw, request_id, latency)
+                        if on_event:
+                            if parsed_resp.reasoning:
+                                on_event(StreamEvent("thinking_delta", text=parsed_resp.reasoning))
+                            if parsed_resp.text:
+                                on_event(StreamEvent("text_delta", text=parsed_resp.text))
+                            on_event(StreamEvent("done", data={"finish_reason": parsed_resp.finish_reason, "usage": parsed_resp.usage.to_dict()}))
+                        return parsed_resp
+
+                    text = "".join(text_parts)
+                    reasoning: Optional[str] = "".join(reasoning_parts) or None
+                    if not reasoning:
+                        reasoning, text = split_thinking(text)
+                    tool_calls: list[ToolCall] = []
+                    for idx in sorted(tc_acc):
+                        entry = tc_acc[idx]
+                        raw_args = "".join(entry["args"]) or "{}"
+                        parsed_args = extract_json(raw_args)
+                        args_dict = parsed_args if isinstance(parsed_args, dict) else {"_raw": raw_args}
+                        tool_calls.append(ToolCall(id=entry["id"] or self.ids.new("call"), name=entry["name"], arguments=args_dict))
+                    usage = self._usage(usage_raw)
+                    if on_event:
+                        on_event(StreamEvent("done", data={"finish_reason": finish_reason, "usage": usage.to_dict()}))
+                    return ModelResponse(
+                        text=text,
+                        reasoning=reasoning,
+                        tool_calls=tool_calls,
+                        usage=usage,
+                        request_id=request_id,
+                        finish_reason=finish_reason,
+                        latency_s=latency,
+                        model=model_name,
+                    )
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", "replace")[:500]
+                except Exception:
+                    pass
+                retryable = e.code in (408, 409, 425, 429, 500, 502, 503, 504)
+                last = ModelError(f"HTTP {e.code}: {body}", status=e.code, retryable=retryable)
+                if not retryable:
+                    raise last
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+                last = ModelError(f"transport error: {e}", retryable=True)
+            if attempt < self.max_retries:
+                time.sleep(delay)
+                delay = min(delay * 2, 16.0)
+        assert last is not None
+        raise last
 
     def health(self) -> dict[str, Any]:
         try:

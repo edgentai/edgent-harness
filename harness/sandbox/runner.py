@@ -22,6 +22,7 @@ from typing import Any, Optional
 MAX_OUTPUT = 20_000
 
 _unshare_ok: Optional[bool] = None
+_sandbox_exec_ok: Optional[bool] = None
 
 
 def which(name: str) -> Optional[str]:
@@ -43,15 +44,42 @@ def _can_unshare() -> bool:
     return _unshare_ok
 
 
+def _macos_sandbox_profile(workdir: str) -> str:
+    real = os.path.realpath(workdir)
+    return (
+        "(version 1)(allow default)(deny network*)"
+        "(deny file-write*)"
+        f'(allow file-write* (subpath "{real}") (subpath "/dev") '
+        '(subpath "/private/var/folders"))'
+    )
+
+
+def _can_sandbox_exec() -> bool:
+    global _sandbox_exec_ok
+    if _sandbox_exec_ok is None:
+        exe = which("sandbox-exec")
+        if not exe or sys.platform != "darwin":
+            _sandbox_exec_ok = False
+        else:
+            try:
+                r = subprocess.run([exe, "-p", "(version 1)(allow default)", "/usr/bin/true"], capture_output=True, timeout=5)
+                _sandbox_exec_ok = r.returncode == 0
+            except Exception:
+                _sandbox_exec_ok = False
+    return _sandbox_exec_ok
+
+
 def _limits(cpu_seconds: int, memory_bytes: int):
     def apply() -> None:
         try:
             import resource
 
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
-            # Address-space limits break some runtimes (ffmpeg maps large regions); use a generous floor.
-            soft = max(memory_bytes, 512 << 20)
-            resource.setrlimit(resource.RLIMIT_AS, (soft, soft))
+            # On macOS, Mach VM reserves large virtual address spaces for Python/NumPy/Chromium;
+            # RLIMIT_AS breaks valid workloads there, so enforce it on non-darwin POSIX hosts.
+            if sys.platform != "darwin":
+                soft = max(memory_bytes, 512 << 20)
+                resource.setrlimit(resource.RLIMIT_AS, (soft, soft))
             resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
         except Exception:
             pass
@@ -123,8 +151,11 @@ def run_subprocess(
     if allowed_executables is not None and exe_name not in allowed_executables and argv[0] not in allowed_executables:
         return SandboxResult(126, "", f"executable not allowed: {exe_name}", 0.0, argv=argv)
     full = list(argv)
-    if not allow_network and _can_unshare():
-        full = [which("unshare") or "unshare", "-n", *full]
+    if not allow_network:
+        if _can_unshare():
+            full = [which("unshare") or "unshare", "-n", *full]
+        elif _can_sandbox_exec():
+            full = [which("sandbox-exec") or "sandbox-exec", "-p", _macos_sandbox_profile(cwd), *full]
     t0 = time.monotonic()
     try:
         proc = subprocess.Popen(
@@ -154,13 +185,14 @@ def run_subprocess(
 
 
 def run_python(code: str, cwd: str, timeout_s: float = 60.0, cpu_seconds: int = 30, memory_bytes: int = 1 << 30,
-               allow_network: bool = False) -> SandboxResult:
+               allow_network: bool = False, python_executable: str = "") -> SandboxResult:
     """Run a Python snippet as an isolated process (``-I``) inside ``cwd``."""
     os.makedirs(os.path.join(cwd, "scratch"), exist_ok=True)
     script = os.path.join(cwd, "scratch", f"cell_{int(time.time() * 1000)}_{threading.get_ident()}.py")
     with open(script, "w", encoding="utf-8") as f:
         f.write(code)
-    return run_subprocess([sys.executable, "-I", script], cwd, timeout_s, cpu_seconds, memory_bytes, allow_network)
+    py = (python_executable or os.environ.get("CODE_RUNNER_PYTHON", "")).strip() or sys.executable
+    return run_subprocess([py, "-I", script], cwd, timeout_s, cpu_seconds, memory_bytes, allow_network)
 
 
 _CHILD = textwrap.dedent(

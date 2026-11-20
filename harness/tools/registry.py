@@ -58,12 +58,21 @@ class ToolSpec:
     timeout_s: float = 60.0
     idempotent: bool = True
     side_effects: bool = False
+    # Only replay cached results for side-effecting calls when an explicit idempotency_key
+    # is supplied OR idempotent_replay is True (so reverting a file edit actually writes!).
+    idempotent_replay: bool = False
     cost_class: str = "cheap"  # cheap | moderate | expensive
     when_not_to_use: str = ""
     examples: list[dict[str, Any]] = field(default_factory=list)
     version: int = 1
 
-    def openai_schema(self) -> dict[str, Any]:
+    def openai_schema(self, *, compact: bool = False) -> dict[str, Any]:
+        if compact:
+            props = {}
+            for k, v in (self.parameters.get("properties") or {}).items():
+                props[k] = {pk: pv for pk, pv in v.items() if pk in ("type", "enum", "items", "minimum", "maximum")}
+            params = {"type": "object", "properties": props, "required": list(self.parameters.get("required") or [])}
+            return {"type": "function", "function": {"name": self.name, "description": self.description.split("\n", 1)[0][:220], "parameters": params}}
         desc = self.description
         if self.when_not_to_use:
             desc += f" Do not use when: {self.when_not_to_use}"
@@ -71,11 +80,12 @@ class ToolSpec:
             desc += " Example: " + json.dumps(self.examples[0])
         return {"type": "function", "function": {"name": self.name, "description": desc, "parameters": self.parameters}}
 
-    def mcp_schema(self) -> dict[str, Any]:
+    def mcp_schema(self, *, compact: bool = False) -> dict[str, Any]:
+        params = self.openai_schema(compact=True)["function"]["parameters"] if compact else self.parameters
         return {
             "name": self.name,
-            "description": self.description,
-            "inputSchema": self.parameters,
+            "description": self.description.split("\n", 1)[0][:220] if compact else self.description,
+            "inputSchema": params,
             "outputSchema": self.returns,
             "annotations": {
                 "readOnlyHint": not self.side_effects,
@@ -190,12 +200,15 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools)
 
-    def openai_schemas(self, allowlist: Optional[set[str]] = None) -> list[dict[str, Any]]:
-        return [t.openai_schema() for n, t in sorted(self._tools.items()) if allowlist is None or n in allowlist]
+    def all(self) -> list[ToolSpec]:
+        return [self._tools[n] for n in self.names()]
 
-    def mcp_manifest(self) -> dict[str, Any]:
+    def openai_schemas(self, allowlist: Optional[set[str]] = None, *, compact: bool = False) -> list[dict[str, Any]]:
+        return [t.openai_schema(compact=compact) for n, t in sorted(self._tools.items()) if allowlist is None or n in allowlist]
+
+    def mcp_manifest(self, *, compact: bool = False, allowlist: Optional[set[str]] = None) -> dict[str, Any]:
         """``tools/list`` response shape of the Model Context Protocol."""
-        return {"tools": [t.mcp_schema() for _, t in sorted(self._tools.items())]}
+        return {"tools": [t.mcp_schema(compact=compact) for n, t in sorted(self._tools.items()) if allowlist is None or n in allowlist]}
 
     def improve_description(self, name: str, new_description: str, when_not_to_use: str = "") -> None:
         spec = self._tools[name]
@@ -213,8 +226,18 @@ class ToolRegistry:
         t0 = time.monotonic()
         spec = self._tools.get(name)
 
-        def fail(code: str, msg: str, retryable: bool = False, **details: Any) -> ToolResult:
-            err = ToolError(code, msg, retryable, details)
+        _CATEGORIES = {
+            "invalid_arguments": ("invalid_input", "Check the tool schema and supply valid arguments; do not repeat the unchanged call."),
+            "not_found": ("not_found", "Verify the path, artifact_id, or tool name before retrying."),
+            "timeout": ("timeout", "Reduce work per call or inspect partial outputs before retrying."),
+            "permission_denied": ("permission_denied", "Use an allowed tool or request user approval."),
+            "unavailable": ("unavailable", "Record this gap/unknown and proceed with available tools."),
+            "execution_error": ("execution_failure", "Inspect the error message and fix the input or code."),
+        }
+
+        def fail(code: str, msg: str, retryable: bool = False, category: str = "", remediation: str = "", **details: Any) -> ToolResult:
+            default_cat, default_rem = _CATEGORIES.get(code, ("execution_failure", "Adjust arguments before retrying."))
+            err = ToolError(code, msg, retryable, details, category=category or default_cat, remediation=remediation or default_rem)
             if spec is not None:
                 self._record_failure(name, arguments, err)
             res = ToolResult(call_id, name, False, None, err, duration_s=time.monotonic() - t0)
@@ -230,10 +253,28 @@ class ToolRegistry:
         errs = validate_args(spec.parameters, arguments)
         if errs:
             return fail("invalid_arguments", "; ".join(errs), schema=spec.parameters)
-        if spec.permission in DANGEROUS:
+
+        # Optional PreToolUse hooks (attached via ctx.extra["hooks"])
+        hooks = ctx.extra.get("hooks") if isinstance(ctx.extra, dict) else None
+        if hooks is not None:
+            decision = hooks.run_pre_tool_use(name, arguments, ctx)
+            if not decision.allow:
+                return fail("permission_denied", decision.reason or f"blocked by pre_tool_use hook on '{name}'")
+            if decision.updated_arguments is not None:
+                arguments = decision.updated_arguments
+
+        # Permission policy (either ctx.extra["policy"] or legacy ctx.approve)
+        policy = ctx.extra.get("policy") if isinstance(ctx.extra, dict) else None
+        if policy is not None:
+            ok_perm, reason = policy.check(spec, arguments, ctx.approve)
+            if not ok_perm:
+                return fail("permission_denied", reason)
+        elif spec.permission in DANGEROUS:
             if ctx.approve is None or not ctx.approve(name, arguments):
                 return fail("permission_denied", f"tool '{name}' ({spec.permission}) requires policy approval; none was granted")
-        if spec.side_effects and self.idempotency is not None:
+
+        should_replay = spec.side_effects and self.idempotency is not None and (idempotency_key is not None or spec.idempotent_replay)
+        if should_replay:
             key = idempotency_key or f"{name}:{json_dumps(arguments)}"
             cached = self.idempotency.get(ctx.run_id, key)
             if cached is not None:
@@ -247,7 +288,7 @@ class ToolRegistry:
         except concurrent.futures.TimeoutError:
             return fail("timeout", f"tool '{name}' exceeded {spec.timeout_s}s", retryable=True)
         except ToolFailure as e:
-            return fail(e.code, str(e), e.retryable, **e.details)
+            return fail(e.code, str(e), e.retryable, category=e.category, remediation=e.remediation, **e.details)
         except FileNotFoundError as e:
             return fail("not_found", str(e))
         except PermissionError as e:
@@ -261,8 +302,10 @@ class ToolRegistry:
                 artifact_ids.append(output["artifact_id"])
         output, compacted = self._compact(output, ctx, name)
         res = ToolResult(call_id, name, True, output, None, artifact_ids, time.monotonic() - t0, compacted)
-        if spec.side_effects and self.idempotency is not None:
+        if should_replay:
             self.idempotency.put(ctx.run_id, idempotency_key or f"{name}:{json_dumps(arguments)}", res.to_dict())
+        if hooks is not None:
+            hooks.run_post_tool_use(name, arguments, res, ctx)
         self._trace(ctx, res, arguments)
         return res
 
@@ -271,13 +314,15 @@ class ToolRegistry:
         text = json_dumps(output) if not isinstance(output, str) else output
         if len(text) <= MAX_INLINE_OUTPUT_CHARS:
             return output, False
+        preview = truncate(text, MAX_INLINE_OUTPUT_CHARS)
+        if ctx.store is None:
+            return {"compacted": True, "preview": preview, "chars": len(text)}, True
         from ..core.types import Modality
 
         art = ctx.store.put_bytes(text.encode("utf-8"), "application/json" if not isinstance(output, str) else "text/plain", Modality.TEXT,
                                   source=f"tool:{name}", ext=".txt")
         ctx.store.put_text_view(art.id, "text", text)
         ctx.store.put_json_view(art.id, "summary", {"modality": "text", "tool_output": name, "chars": len(text)})
-        preview = truncate(text, MAX_INLINE_OUTPUT_CHARS)
         return {"compacted": True, "preview": preview, "full_output_artifact_id": art.id, "chars": len(text),
                 "hint": "use fetch_artifact_view with offset/length to page through the full output"}, True
 
@@ -298,8 +343,10 @@ class ToolRegistry:
 class ToolFailure(Exception):
     """Raise inside a tool to return a typed error."""
 
-    def __init__(self, code: str, message: str, retryable: bool = False, **details: Any) -> None:
+    def __init__(self, code: str, message: str, retryable: bool = False, category: str = "", remediation: str = "", **details: Any) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.category = category
+        self.remediation = remediation
         self.details = details

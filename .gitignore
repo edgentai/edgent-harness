@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .harness/
+.edgent/
 *.egg-info/
 build/
 dist/

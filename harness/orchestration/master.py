@@ -136,6 +136,15 @@ class Harness:
             return MockModelClient(ids=self.ids)
         s = self.config.serving
         c = self.config.capabilities
+        if backend == "anthropic":
+            from ..core.providers import AnthropicMessagesClient
+
+            return AnthropicMessagesClient(
+                s.base_url, s.model, s.api_key, timeout_s=s.timeout_s, max_retries=s.max_retries,
+                native_tool_calls=c.native_tool_calls, native_image=c.native_image,
+                price_per_million_prompt=s.price_per_million_prompt,
+                price_per_million_completion=s.price_per_million_completion, ids=self.ids,
+            )
         return OpenAICompatibleClient(s.base_url, s.model, s.api_key, s.timeout_s, s.max_retries, s.price_per_million_prompt, s.price_per_million_completion,
                                       c.native_image, c.native_audio, c.native_video, c.thinking_switch, self.ids)
 
@@ -345,16 +354,18 @@ class Harness:
 
     def _tool_ctx(self, state: RunState, node_id: str, role: str) -> ToolContext:
         def spawn(sub_role: str, sub_task: str, opts: dict[str, Any]) -> dict[str, Any]:
-            if state.budget.used_branches >= state.budget.max_branches:
-                return {"ok": False, "error": "branch budget exhausted"}
-            state.budget.used_branches += 1
-            res = self._run_agent(state, f"{node_id}.sub{state.budget.used_branches}", sub_role, sub_task, AgentBudget(max(2, opts.get("max_tool_calls", 8) // 2), opts.get("max_tool_calls", 8)))
+            with self._lock:
+                if state.budget.used_branches >= state.budget.max_branches:
+                    return {"ok": False, "error": "branch budget exhausted"}
+                state.budget.used_branches += 1
+                branch_num = state.budget.used_branches
+            res, _ = self._run_agent(state, f"{node_id}.sub{branch_num}", sub_role, sub_task, AgentBudget(max(2, opts.get("max_tool_calls", 8) // 2), opts.get("max_tool_calls", 8)))
             return {"answer": res.answer, "claims": [c.to_dict() for c in res.claims], "confidence": res.confidence, "gaps": res.gaps, "cost": res.usage.to_dict()}
 
         return ToolContext(state.run_id, node_id, self.store, state.workspace, self.sidecars, self.config, self.memory, state.tracer,
                            self.ask_user, spawn if state.profile.sub_agents_allowed else None, self.approve, role)
 
-    def _run_agent(self, state: RunState, node_id: str, role: str, task: str, agent_budget: Optional[AgentBudget] = None, lessons: Optional[list[str]] = None) -> SubAgentResult:
+    def _run_agent(self, state: RunState, node_id: str, role: str, task: str, agent_budget: Optional[AgentBudget] = None, lessons: Optional[list[str]] = None) -> tuple[SubAgentResult, SubAgent]:
         ctx = self._tool_ctx(state, node_id, role)
         allow = allowlist_for(role, state.profile.sub_agents_allowed, self.ask_user is not None)
         agent = SubAgent(role, self.client, self.registry, ctx, allow, state.profile, self.config.capabilities, system_prompt, state.budget, state.tracer, self.metrics, state.cost, self.ids, agent_budget)

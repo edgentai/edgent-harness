@@ -9,4 +9,8 @@ from .client import (  # noqa: F401
     OpenAICompatibleClient,
     MockModelClient,
     ModelError,
+    StreamEvent,
+    StreamCallback,
 )
+from .providers import AnthropicMessagesClient, ModelRouter, PromptTooLargeError, StageRoute  # noqa: F401
+from .tool_protocol import parse_tool_calls, render_tools_prompt, strip_tool_calls  # noqa: F401

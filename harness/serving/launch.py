@@ -60,10 +60,11 @@ class Supervisor:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            time.sleep(self.check_interval_s)
+            if self._stop.wait(self.check_interval_s):
+                break
             dead = self.proc is None or self.proc.poll() is not None
             if dead or not self._safe_health():
-                if self.restarts >= self.max_restarts:
+                if self._stop.is_set() or self.restarts >= self.max_restarts:
                     break
                 self.restarts += 1
                 try:
@@ -71,6 +72,8 @@ class Supervisor:
                         self.proc.kill()
                 except Exception:
                     pass
+                if self._stop.is_set():
+                    break
                 self.proc = self._popen(self.command)
                 if self.on_restart:
                     try:
@@ -88,3 +91,5 @@ class Supervisor:
         self._stop.set()
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)

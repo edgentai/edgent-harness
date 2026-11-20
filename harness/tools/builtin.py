@@ -36,6 +36,11 @@ def _sbx(ctx: ToolContext) -> dict[str, Any]:
     return {"cpu_seconds": sb.cpu_seconds, "memory_bytes": sb.memory_bytes, "allow_network": sb.allow_network}
 
 
+def _py_sbx(ctx: ToolContext) -> dict[str, Any]:
+    sb = ctx.config.sandbox
+    return {"cpu_seconds": sb.cpu_seconds, "memory_bytes": sb.memory_bytes, "allow_network": sb.allow_network, "python_executable": sb.python_executable}
+
+
 # ---------------------------------------------------------------- files
 def read_file(ctx: ToolContext, a: dict[str, Any]) -> Any:
     text = ctx.workspace.read_text(a["path"])
@@ -61,7 +66,7 @@ def search_files(ctx: ToolContext, a: dict[str, Any]) -> Any:
 
 # ---------------------------------------------------------------- code
 def run_code(ctx: ToolContext, a: dict[str, Any]) -> Any:
-    r = run_python(a["code"], ctx.workspace.path, timeout_s=min(float(a.get("timeout_s", 30)), ctx.config.sandbox.timeout_s), **_sbx(ctx))
+    r = run_python(a["code"], ctx.workspace.path, timeout_s=min(float(a.get("timeout_s", 30)), ctx.config.sandbox.timeout_s), **_py_sbx(ctx))
     out = r.to_dict()
     out["ok"] = r.ok
     return out
