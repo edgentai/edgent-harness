@@ -13,6 +13,7 @@ dependencies = []
 
 [project.scripts]
 harness = "harness.__main__:main"
+edgent = "edgent.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["harness*"]
