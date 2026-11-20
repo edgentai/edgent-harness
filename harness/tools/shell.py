@@ -27,8 +27,8 @@ from ..core.utils import ensure_dir
 from ..sandbox.runner import _can_sandbox_exec, _can_unshare, _limits, _macos_sandbox_profile, _scrubbed_env, which
 from .registry import ToolContext, ToolFailure
 
-INLINE_STDOUT_CHARS = 3_500
-INLINE_STDERR_CHARS = 1_500
+INLINE_STDOUT_CHARS = 16_000
+INLINE_STDERR_CHARS = 4_000
 
 
 def _shell_executable() -> str:

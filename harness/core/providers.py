@@ -160,10 +160,10 @@ class AnthropicMessagesClient(ModelClient):
         if not messages:
             messages = [{"role": "user", "content": [{"type": "text", "text": "Continue."}]}]
 
-        if self.single_turn_flatten and len(messages) > 1:
+        if self.single_turn_flatten and messages:
             # Single-turn CLI bridges (e.g. gemini_bridge.py, claude_bridge.py) ignore
-            # role=="assistant" messages. Fold the conversation into one user message so
-            # prior assistant tool calls and tool outputs survive intact.
+            # role=="assistant" messages. Always apply the same [USER]/[ASSISTANT] framing
+            # from turn 1 onward so the user-message prefix stays cache-stable across turns.
             flat_blocks: list[dict[str, Any]] = []
             for msg in messages:
                 tag = "[ASSISTANT]" if msg["role"] == "assistant" else "[USER]"
@@ -194,6 +194,15 @@ class AnthropicMessagesClient(ModelClient):
             if use_cache and atools:
                 atools[-1]["cache_control"] = {"type": "ephemeral"}
             payload["tools"] = atools
+        if use_cache and messages:
+            # Mark the tail of the latest user turn as a conversation prefix cache breakpoint
+            # (total <= 3 breakpoints: system, last tool, latest user turn).
+            for msg in reversed(messages):
+                if msg.get("role") == "user" and isinstance(msg.get("content"), list) and msg["content"]:
+                    last_blk = msg["content"][-1]
+                    if isinstance(last_blk, dict) and last_blk.get("type") in ("text", "tool_result"):
+                        last_blk["cache_control"] = {"type": "ephemeral"}
+                    break
         effort = req.metadata.get("effort") or self.effort
         if effort:
             payload["output_config"] = {"effort": effort}
@@ -246,12 +255,18 @@ class AnthropicMessagesClient(ModelClient):
         ct = int(u.get("output_tokens", 0) or 0)
         cached = int(u.get("cache_read_input_tokens", 0) or 0)
         rt = int(u.get("reasoning_tokens") or bridge.get("thinking_tokens") or 0)
+        cost = (pt * self.price_prompt + ct * self.price_completion) / 1e6
+        if cost == 0.0 and bridge.get("cost_usd"):
+            try:
+                cost = float(bridge["cost_usd"])
+            except (TypeError, ValueError):
+                cost = 0.0
         return Usage(
             prompt_tokens=pt,
             completion_tokens=ct,
             reasoning_tokens=rt,
             cached_tokens=cached,
-            cost_usd=(pt * self.price_prompt + ct * self.price_completion) / 1e6,
+            cost_usd=cost,
         )
 
     def _parse_response(self, raw: dict[str, Any], req: ModelRequest, request_id: str, latency: float) -> ModelResponse:

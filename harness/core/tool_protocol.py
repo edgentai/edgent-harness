@@ -43,10 +43,16 @@ def render_tools_prompt(openai_schemas: list[dict[str, Any]], *, compact: bool =
     """Render tool declarations + sentinel-safe invocation instructions."""
     lines = [
         "## Tools (text protocol)",
-        "To call a tool, emit one or more `<edgent_call>` blocks. Wrap multi-line, LaTeX, HTML or code arguments in `<![CDATA[...]]>` (or pass `sentinel=\"END_TAG\"` on `<edgent_arg>` if content contains `]]>`):",
+        "You do NOT have any built-in tools outside this protocol. The ONLY way to read files, edit files, run commands, or execute code is to emit `<edgent_call>` blocks and END YOUR RESPONSE immediately so the harness executes them and returns `[tool_result]` blocks on the next turn.",
+        "",
+        "Strict rules:",
+        "- Emit one or more `<edgent_call>` blocks, then STOP IMMEDIATELY after the final `</edgent_call>`.",
+        "- NEVER simulate, guess, or fabricate `[tool_result]` outputs, command outputs, or file contents you have not directly observed in a returned `[tool_result]`.",
+        "- NEVER claim a file is missing, report line numbers/quotes, or report code output unless an actual `[tool_result]` in this conversation returned it.",
+        "- Wrap multi-line, LaTeX, HTML, or code arguments in `<![CDATA[...]]>` (or pass `sentinel=\"END_TAG\"` on `<edgent_arg>` if content contains `]]>`).",
         "",
         '<edgent_call tool="edit_file">',
-        '<edgent_arg name="path">book/ch1.md</edgent_arg>',
+        '<edgent_arg name="path">docs/example.md</edgent_arg>',
         '<edgent_arg name="old"><![CDATA[exact text]]></edgent_arg>',
         '<edgent_arg name="new"><![CDATA[replacement with $\\frac{a}{b}$ and <code>x</code>]]></edgent_arg>',
         "</edgent_call>",
@@ -145,7 +151,7 @@ def _parse_args(body: str, param_schemas: Optional[dict[str, Any]] = None) -> di
                     end = body.find("</edgent_arg>", start)
                     if end == -1:
                         break
-                    raw = body[start:end]
+                    raw = body[c_start:end]
                     pos = end + len("</edgent_arg>")
             else:
                 end = body.find("</edgent_arg>", start)

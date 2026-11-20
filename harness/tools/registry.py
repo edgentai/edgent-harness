@@ -22,7 +22,7 @@ from ..core.utils import IdGenerator, json_dumps, truncate
 
 PERMISSION_CLASSES = ("read", "compute", "write", "network", "spawn", "interactive", "delete")
 DANGEROUS = {"write", "network", "delete"}
-MAX_INLINE_OUTPUT_CHARS = 6000
+MAX_INLINE_OUTPUT_CHARS = 24_000
 
 
 @dataclass

@@ -134,6 +134,7 @@ class ProviderAndStreamingTests(unittest.TestCase):
         self.assertIsInstance(captured[0]["system"], list)
         self.assertEqual(captured[0]["system"][0]["cache_control"], {"type": "ephemeral"})
         self.assertEqual(captured[0]["tools"][-1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(captured[0]["messages"][-1]["content"][-1]["cache_control"], {"type": "ephemeral"})
         self.assertEqual(captured[0]["output_config"]["effort"], "high")
 
         # Hard byte cap fails fast before transport
@@ -289,8 +290,8 @@ class GeneralToolsTests(unittest.TestCase):
         r2 = self.reg.call("bash", {"command": "pwd"}, ctx)
         self.assertTrue(r2.output["stdout"].strip().endswith("/subdir"))
 
-        # Large output (> 8 KB) is offloaded to .edgent/tool_outputs/
-        big = self.reg.call("bash", {"command": f"{sys.executable} -c \"print('A' * 12000)\""}, ctx)
+        # Large output (> 16 KB) is offloaded to .edgent/tool_outputs/
+        big = self.reg.call("bash", {"command": f"{sys.executable} -c \"print('A' * 20000)\""}, ctx)
         self.assertTrue(big.ok)
         self.assertIsNotNone(big.output["stdout_log"])
         self.assertTrue(os.path.isfile(self.ws.resolve(big.output["stdout_log"])))
@@ -543,6 +544,83 @@ class AgentLoopReliabilityTests(unittest.TestCase):
             self.assertEqual(len(rev_client.calls), 2)
         finally:
             loop2.close()
+
+    def test_cache_stable_orientation_micro_compact_and_grounding_guard(self):
+        d = tempfile.mkdtemp()
+        ws = Workspace.open(d, create_subdirs=False)
+        ws.write_text("big.txt", "SECRET_LINE_42\n" + ("lorem ipsum dolor sit amet " * 200))
+
+        # 1) Creating new files must NOT mutate msgs[1] orientation (preserves prompt cache prefix)
+        c1 = MockModelClient()
+        c1.push(
+            ModelResponse(text="", tool_calls=[ToolCall("w1", "write_file", {"path": "newly_created.md", "content": "hi"})]),
+            ModelResponse(text="Created file."),
+            ModelResponse(text="Next turn still has stable prefix."),
+        )
+        loop = AgentLoop(workspace=ws, client=c1, policy=PermissionPolicy(mode=PermissionMode.AUTO))
+        try:
+            loop.send("cache-1", "Create a file.")
+            loop.send("cache-1", "Follow up.")
+            orient_t1 = c1.calls[0].messages[1].plain_text()
+            orient_t2 = c1.calls[1].messages[1].plain_text()
+            orient_t3 = c1.calls[2].messages[1].plain_text()
+            self.assertEqual(orient_t1, orient_t2)
+            self.assertEqual(orient_t1, orient_t3)
+            self.assertNotIn("newly_created.md", orient_t3)
+        finally:
+            loop.close()
+
+        # 2) Micro-compaction shrinks older bulky read_file outputs in memory while keeping transcript verbatim
+        c2 = MockModelClient()
+        c2.push(
+            ModelResponse(text="", tool_calls=[ToolCall("r1", "read_file", {"path": "big.txt"})]),
+            ModelResponse(text="Read big.txt."),
+            ModelResponse(text="Turn 2."),
+            ModelResponse(text="Turn 3."),
+            ModelResponse(text="Turn 4."),
+        )
+        loop2 = AgentLoop(
+            workspace=ws,
+            client=c2,
+            micro_compact_tool_results=True,
+            micro_compact_keep_turns=2,
+            micro_compact_trigger_chars=4_000,
+            policy=PermissionPolicy(mode=PermissionMode.AUTO),
+        )
+        try:
+            loop2.send("mc-1", "Read big.txt")
+            loop2.send("mc-1", "Step 2")
+            loop2.send("mc-1", "Step 3")
+            loop2.send("mc-1", "Step 4")
+            last_tool_texts = [m.plain_text() for m in c2.calls[-1].messages if m.role == "tool"]
+            self.assertTrue(any("earlier read_file output cleared" in t for t in last_tool_texts))
+            # Verbatim transcript still supports session_recall!
+            self.assertTrue(len(loop2.sessions.recall("mc-1", "SECRET_LINE_42")) >= 1)
+        finally:
+            loop2.close()
+
+        # 3) Reviewer grounding guard rejects Turn-1 ungrounded reply with 0 tool calls and nudges tool use
+        c3 = MockModelClient()
+        c3.push(
+            ModelResponse(text="", tool_calls=[ToolCall("sp1", "spawn_subagent", {"role": "reviewer", "task": "Audit big.txt"})]),
+            # Reviewer Turn 1: tries to hallucinate without calling any tool!
+            ModelResponse(text="Everything looks broken without reading."),
+            # Reviewer Turn 2 (after automatic grounding nudge): actually calls read_file!
+            ModelResponse(text="", tool_calls=[ToolCall("rv1", "read_file", {"path": "big.txt", "start_line": 1, "end_line": 3})]),
+            ModelResponse(text="Verified SECRET_LINE_42 in big.txt."),
+            # Parent final reply:
+            ModelResponse(text="Reviewer verified big.txt."),
+        )
+        loop3 = AgentLoop(workspace=ws, client=c3, policy=PermissionPolicy(mode=PermissionMode.AUTO))
+        try:
+            res = loop3.send("guard-1", "Run reviewer on big.txt")
+            self.assertEqual(res.status, "completed")
+            # Confirm the reviewer's returned tool result includes tools_used=["read_file"]
+            parent_tool_msg = [m.plain_text() for m in c3.calls[-1].messages if m.role == "tool"][0]
+            self.assertIn('"tools_used": ["read_file"]', parent_tool_msg)
+            self.assertIn("Verified SECRET_LINE_42", parent_tool_msg)
+        finally:
+            loop3.close()
 
 
 class MCPClientServerTests(unittest.TestCase):

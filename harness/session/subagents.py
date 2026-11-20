@@ -27,6 +27,7 @@ class SubagentSpec:
     max_turns: int = 16
     effort: Optional[str] = None
     skills: list[str] = field(default_factory=list)
+    require_tool_use: bool = False
 
 
 BUILTIN_SUBAGENTS: dict[str, SubagentSpec] = {
@@ -35,11 +36,12 @@ BUILTIN_SUBAGENTS: dict[str, SubagentSpec] = {
         description="Fast read-only workspace explorer: locate files, grep patterns, inspect code or documents, and return a concise factual summary with file paths and line numbers.",
         system_prompt=(
             "You are a fast, read-only exploration subagent. Search the workspace with glob_files, search_files, "
-            "and read_file, then return a concise, structured summary citing exact file paths and line numbers. "
-            "Never modify files."
+            "and read_file, then return a concise, structured summary citing exact file paths and line numbers "
+            "that you directly observed in tool results. Never modify files or guess uninspected contents."
         ),
         tools=["read_file", "read_numbered", "list_files", "glob_files", "search_files", "fetch_artifact_view", "list_artifacts", "count_matches"],
-        max_turns=12,
+        max_turns=14,
+        require_tool_use=True,
     ),
     "coder": SubagentSpec(
         name="coder",
@@ -57,12 +59,16 @@ BUILTIN_SUBAGENTS: dict[str, SubagentSpec] = {
         description="Independent fresh-context reviewer/critic. Audits work against requirements, source files, and executable checks with zero author history; returns a concrete defect list.",
         system_prompt=(
             "You are an independent reviewer with NO shared history from whoever produced the work. "
-            "Read the original sources, instructions, and resulting files yourself, run verification checks with bash / "
-            "run_python / run_tests if relevant, and identify concrete defects (correctness, missing requirements, edge "
-            "cases, factual drift, broken code). Never edit files. Return a crisp, actionable review (or JSON if requested)."
+            "You MUST read every target file and reference file yourself using read_file (with start_line/end_line "
+            "for large files) and run real verification checks via bash / run_python / run_tests BEFORE writing "
+            "your final review. Prefer read_file over bash cat when reading files. "
+            "NEVER fabricate, simulate, or infer file contents, line numbers, or code outputs that were not returned "
+            "in an actual tool result in this session. Never edit files. "
+            "Return a crisp, prioritized defect list citing only verified observations, plus what you verified as correct."
         ),
         tools=["read_file", "read_numbered", "list_files", "glob_files", "search_files", "bash", "run_command", "run_python", "run_tests", "lint_code", "calculate"],
-        max_turns=12,
+        max_turns=20,
+        require_tool_use=True,
     ),
     "planner": SubagentSpec(
         name="planner",
